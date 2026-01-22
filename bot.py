@@ -124,7 +124,7 @@ def get_channels_by_category(category_id):
                 "id": ch["stream_id"],
                 "name": ch["name"],
                 "category_id": category_id,
-                "url": f"{IPTV_SERVER}/live/{IPTV_USER}/{IPTV_PASS}/{ch['stream_id']}.m3u8"
+                "url": f"{IPTV_SERVER}/live/{IPTV_USER}/{IPTV_PASS}/{ch['stream_id']}.ts"
             }
             for ch in channels
         ]
