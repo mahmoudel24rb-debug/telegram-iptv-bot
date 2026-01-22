@@ -1,0 +1,25 @@
+# Fichiers sensibles - NE PAS COMMIT
+.env
+*.session
+user_session.session
+session_generator.session
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
