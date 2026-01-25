@@ -319,7 +319,12 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await pytgcalls.play(
             CHAT_ID,
-            MediaStream(channel["url"], audio_parameters=AudioQuality.STUDIO, video_parameters=VideoQuality.HD_720p)
+            MediaStream(
+                channel["url"],
+                audio_parameters=AudioQuality.STUDIO,
+                video_parameters=VideoQuality.HD_720p,
+                ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 10000000 -probesize 10000000"
+            )
         )
         current_stream = channel
         await update.message.reply_text(f"Stream demarre: {channel['name']}")
@@ -366,7 +371,12 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await pytgcalls.play(
             CHAT_ID,
-            MediaStream(test_url, audio_parameters=AudioQuality.STUDIO, video_parameters=VideoQuality.HD_720p)
+            MediaStream(
+                test_url,
+                audio_parameters=AudioQuality.STUDIO,
+                video_parameters=VideoQuality.HD_720p,
+                ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 10000000 -probesize 10000000"
+            )
         )
         current_stream = {"id": "test", "name": "Big Buck Bunny (Test)", "url": test_url}
         await update.message.reply_text("Stream de test demarre!")
