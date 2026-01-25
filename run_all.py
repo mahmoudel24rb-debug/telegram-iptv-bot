@@ -321,9 +321,7 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             CHAT_ID,
             MediaStream(
                 channel["url"],
-                audio_parameters=AudioQuality.HIGH,
-                video_parameters=VideoQuality.SD_480p,
-                ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+                ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -err_detect ignore_err"
             )
         )
         current_stream = channel
@@ -373,9 +371,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             CHAT_ID,
             MediaStream(
                 test_url,
-                audio_parameters=AudioQuality.HIGH,
-                video_parameters=VideoQuality.SD_480p,
-                ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+                ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -err_detect ignore_err"
             )
         )
         current_stream = {"id": "test", "name": "Big Buck Bunny (Test)", "url": test_url}
