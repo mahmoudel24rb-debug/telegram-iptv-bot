@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from pyrogram import Client
 from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream
+from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -317,7 +317,11 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await pytgcalls.play(
             CHAT_ID,
-            MediaStream(channel["url"])
+            MediaStream(
+                channel["url"],
+                audio_parameters=AudioQuality.STUDIO,
+                video_parameters=VideoQuality.HD_720p,
+            )
         )
 
         current_stream = channel
@@ -387,7 +391,11 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await pytgcalls.play(
             CHAT_ID,
-            MediaStream(test_url)
+            MediaStream(
+                test_url,
+                audio_parameters=AudioQuality.STUDIO,
+                video_parameters=VideoQuality.HD_720p,
+            )
         )
 
         current_stream = {"id": "test", "name": "Big Buck Bunny (Test)", "url": test_url}
