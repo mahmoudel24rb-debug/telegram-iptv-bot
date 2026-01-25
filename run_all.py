@@ -117,7 +117,7 @@ def modify_news_message(text: str) -> str:
 
 @user_client.on_message(filters.chat(NEWS_SOURCE_CHANNEL))
 async def forward_news(client: Client, message: Message):
-    """Intercepter et transferer les messages filtres"""
+    """Intercepter et transferer les messages filtres (texte + images)"""
     text = message.text or message.caption or ""
 
     if not text:
@@ -130,11 +130,32 @@ async def forward_news(client: Client, message: Message):
         modified_text = modify_news_message(text)
 
         try:
-            await telegram_bot.send_message(
-                chat_id=NEWS_DEST_CHANNEL,
-                text=modified_text
-            )
-            print(f"[NEWS] Message envoye vers {NEWS_DEST_CHANNEL}")
+            # Verifier si le message contient une photo
+            if message.photo:
+                print(f"[NEWS] Image detectee, telechargement...")
+                # Telecharger la photo
+                photo_path = await message.download()
+
+                # Envoyer la photo avec le texte modifie comme caption
+                with open(photo_path, 'rb') as photo_file:
+                    await telegram_bot.send_photo(
+                        chat_id=NEWS_DEST_CHANNEL,
+                        photo=photo_file,
+                        caption=modified_text
+                    )
+
+                # Supprimer le fichier temporaire
+                import os as os_module
+                os_module.remove(photo_path)
+                print(f"[NEWS] Image + texte envoyes vers {NEWS_DEST_CHANNEL}")
+            else:
+                # Pas d'image, envoyer juste le texte
+                await telegram_bot.send_message(
+                    chat_id=NEWS_DEST_CHANNEL,
+                    text=modified_text
+                )
+                print(f"[NEWS] Message envoye vers {NEWS_DEST_CHANNEL}")
+
         except Exception as e:
             print(f"[NEWS ERREUR] {e}")
     else:
