@@ -4,6 +4,11 @@
 user_session.session
 session_generator.session
 
+# Scripts de test avec credentials hardcodes
+test_*.py
+get_channel_id.py
+news_forwarder.py
+
 # Python
 __pycache__/
 *.py[cod]
