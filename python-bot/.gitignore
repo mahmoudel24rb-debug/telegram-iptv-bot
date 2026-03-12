@@ -1,0 +1,32 @@
+# Fichiers sensibles - NE PAS COMMIT
+.env
+*.env
+session.txt
+*.session
+
+# Scripts de test avec credentials hardcodes
+test_*.py
+get_channel_id.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# Sortie temporaire
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,35 @@
+[Unit]
+Description=BingeBear TV Telegram IPTV Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bingebear
+Group=bingebear
+WorkingDirectory=/home/bingebear/TelegramIPTVBot/python-bot
+ExecStart=/home/bingebear/TelegramIPTVBot/python-bot/venv/bin/python run_all.py
+Restart=always
+RestartSec=10
+
+# Securite — restreindre les acces du processus
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/bingebear/TelegramIPTVBot
+ReadWritePaths=/var/log/bingebear
+ReadWritePaths=/tmp
+PrivateTmp=true
+
+# Variables d'environnement depuis le fichier .env
+EnvironmentFile=/home/bingebear/TelegramIPTVBot/python-bot/.env
+
+# Watchdog systemd — redemarrage si pas de signal pendant 120s
+WatchdogSec=120
+
+# Logs vers journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bingebear-bot
+
+[Install]
+WantedBy=multi-user.target

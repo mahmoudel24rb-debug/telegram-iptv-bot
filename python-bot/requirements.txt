@@ -1,0 +1,7 @@
+python-telegram-bot==21.10
+pyrofork==2.3.58
+py-tgcalls==2.2.10
+python-dotenv
+requests
+tgcrypto
+aiohttp

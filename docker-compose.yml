@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: python-bot/Dockerfile
+    env_file: python-bot/.env
+    restart: always
+    volumes:
+      - bot-logs:/var/log/bingebear
+      - bot-state:/app/state
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    environment:
+      - LOG_DIR=/var/log/bingebear
+      - STREAM_STATE_FILE=/app/state/stream_state.json
+      - NEWS_CACHE_FILE=/app/state/news_cache.json
+
+volumes:
+  bot-logs:
+  bot-state:
