@@ -7,6 +7,7 @@ import os
 import re
 import time
 import asyncio
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from logger import setup_logger
 from config import validate_config
@@ -452,8 +453,92 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/play <id> - Lancer stream\n"
         "/stop - Arreter\n"
         "/status - Statut\n"
-        "/test - Test"
+        "/test - Test\n"
+        "/importnews <jours> - Importer les news (admin)"
     )
+
+
+async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Importer les messages du canal source depuis X jours (admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Non autorise (admin uniquement)")
+        return
+
+    if not HAS_USER_CLIENT or not user_client:
+        await update.message.reply_text("Erreur: client utilisateur non connecte (SESSION_STRING manquante)")
+        return
+
+    # Nombre de jours (defaut: 7)
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+            if days < 1 or days > 30:
+                await update.message.reply_text("Nombre de jours entre 1 et 30")
+                return
+        except ValueError:
+            await update.message.reply_text("Usage: /importnews <nombre_de_jours>\nExemple: /importnews 7")
+            return
+
+    since_date = datetime.now() - timedelta(days=days)
+    await update.message.reply_text(f"Import des news depuis {days} jour(s)...\nCela peut prendre un moment.")
+
+    imported = 0
+    skipped = 0
+
+    try:
+        async for message in user_client.get_chat_history(NEWS_SOURCE_CHANNEL):
+            # Arreter si le message est trop ancien
+            if message.date.replace(tzinfo=None) < since_date:
+                break
+
+            text = message.text or message.caption or ""
+            if not text:
+                continue
+
+            # Verifier si deja transfere
+            if news_cache.is_forwarded(message.id):
+                skipped += 1
+                continue
+
+            if should_forward_news(text):
+                modified_text = modify_news_message(text)
+
+                if message.photo:
+                    photo_path = await message.download()
+                    try:
+                        with open(photo_path, 'rb') as photo_file:
+                            await telegram_bot.send_photo(
+                                chat_id=NEWS_DEST_CHANNEL,
+                                photo=photo_file,
+                                caption=modified_text
+                            )
+                    finally:
+                        try:
+                            os.remove(photo_path)
+                        except OSError:
+                            pass
+                else:
+                    await telegram_bot.send_message(
+                        chat_id=NEWS_DEST_CHANNEL,
+                        text=modified_text
+                    )
+
+                news_cache.mark_forwarded(message.id)
+                imported += 1
+                logger.info(f"Import news: message {message.id} transfere")
+
+                # Pause anti-rate-limit
+                await asyncio.sleep(1.5)
+
+        await update.message.reply_text(
+            f"Import termine!\n"
+            f"Messages importes: {imported}\n"
+            f"Deja importes (ignores): {skipped}"
+        )
+    except Exception as e:
+        logger.exception(f"Erreur dans importnews_command: {e}")
+        await update.message.reply_text(f"Erreur pendant l'import: {e}\nMessages importes avant erreur: {imported}")
 
 
 async def auto_resume_stream():
@@ -576,6 +661,7 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("importnews", importnews_command))
 
     logger.info("Bot pret!")
 
