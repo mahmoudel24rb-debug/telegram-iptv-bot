@@ -125,13 +125,14 @@ def should_forward_news(text: str) -> bool:
 
 
 def modify_news_message(text: str) -> str:
-    """Modifier le message (remplacer la signature)"""
+    """Modifier le message (remplacer la signature et les mentions revendeurs)"""
     text = re.sub(
         r'Queridos Revendedores.*?(?=Enjoy\.|Team|$)',
         '',
         text,
         flags=re.DOTALL | re.IGNORECASE
     )
+    text = re.sub(r'Dear Resellers?\b', 'Dear Users', text, flags=re.IGNORECASE)
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r'Team\s*8K', NEWS_REPLACE_TO, text, flags=re.IGNORECASE)
     return text.strip()
