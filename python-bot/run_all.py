@@ -268,8 +268,18 @@ def escape_markdown(text):
     return text
 
 
+async def reply_private(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Envoyer la reponse en prive a l'utilisateur (jamais dans le canal)"""
+    user_id = update.effective_user.id
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text)
+    except Exception:
+        # Fallback: si le bot ne peut pas envoyer en DM (l'utilisateur n'a pas /start en prive)
+        await reply_private(update, context,text)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await reply_private(update, context,
         "BingeBear TV - Live Streaming Bot\n\n"
         "Commandes:\n"
         "/categories - Liste des categories\n"
@@ -282,10 +292,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Chargement des categories...")
+    await reply_private(update, context, "Chargement des categories...")
     categories = get_categories()
     if not categories:
-        await update.message.reply_text("Aucune categorie disponible")
+        await reply_private(update, context, "Aucune categorie disponible")
         return
 
     # Envoyer toutes les categories en plusieurs messages si necessaire
@@ -297,18 +307,18 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         line = f"* {cat['id']} - {escape_markdown(cat['name'])}\n"
         # Si le message depasse 3800 caracteres, envoyer et recommencer
         if len(current_msg) + len(line) > 3800:
-            await update.message.reply_text(current_msg)
+            await reply_private(update, context, current_msg)
             msg_count += 1
             current_msg = f"Categories (suite {msg_count}):\n\n"
         current_msg += line
 
     current_msg += f"\nTotal: {len(categories)}\nUtilisez /cat <id>"
-    await update.message.reply_text(current_msg)
+    await reply_private(update, context, current_msg)
 
 
 async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /cat <category_id>")
+        await reply_private(update, context, "Usage: /cat <category_id>")
         return
 
     category_id = context.args[0]
@@ -322,14 +332,14 @@ async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if not category:
-        await update.message.reply_text(f"Categorie {category_id} non trouvee")
+        await reply_private(update, context, f"Categorie {category_id} non trouvee")
         return
 
-    await update.message.reply_text(f"Chargement de {category['name']}...")
+    await reply_private(update, context, f"Chargement de {category['name']}...")
     channels = get_channels_by_category(category_id)
 
     if not channels:
-        await update.message.reply_text("Aucune chaine")
+        await reply_private(update, context, "Aucune chaine")
         return
 
     header = f"{escape_markdown(category['name'])} ({len(channels)} chaines):\n\n"
@@ -339,33 +349,33 @@ async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ch in channels:
         line = f"* {ch['id']} - {escape_markdown(ch['name'])}\n"
         if len(current_msg) + len(line) > 3800:
-            await update.message.reply_text(current_msg)
+            await reply_private(update, context, current_msg)
             msg_count += 1
             current_msg = f"Chaines (suite {msg_count}):\n\n"
         current_msg += line
 
     current_msg += f"\nTotal: {len(channels)}\nUtilisez /play <id>"
-    await update.message.reply_text(current_msg)
+    await reply_private(update, context, current_msg)
 
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_stream, pytgcalls
 
     if not is_allowed_user(update.effective_user):
-        await update.message.reply_text("Non autorise")
+        await reply_private(update, context, "Non autorise")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /play <channel_id>")
+        await reply_private(update, context, "Usage: /play <channel_id>")
         return
 
     channel_id = context.args[0]
     channel = get_channel_by_id(channel_id)
     if not channel:
-        await update.message.reply_text("Chaine non trouvee. Utilisez /cat d'abord.")
+        await reply_private(update, context, "Chaine non trouvee. Utilisez /cat d'abord.")
         return
 
-    await update.message.reply_text(f"Demarrage: {channel['name']}")
+    await reply_private(update, context, f"Demarrage: {channel['name']}")
 
     try:
         if current_stream:
@@ -382,10 +392,10 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         health.is_streaming = True
         health.last_stream_activity = time.time()
         save_state(channel)
-        await update.message.reply_text(f"Stream demarre: {channel['name']}")
+        await reply_private(update, context, f"Stream demarre: {channel['name']}")
     except Exception as e:
         logger.exception(f"Erreur dans play_command: {e}")
-        await update.message.reply_text(f"Erreur: {e}")
+        await reply_private(update, context, f"Erreur: {e}")
         current_stream = None
         health.is_streaming = False
         clear_state()
@@ -395,7 +405,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_stream, pytgcalls
 
     if not is_allowed_user(update.effective_user):
-        await update.message.reply_text("Non autorise")
+        await reply_private(update, context, "Non autorise")
         return
 
     try:
@@ -403,27 +413,27 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_stream = None
         health.is_streaming = False
         clear_state()
-        await update.message.reply_text("Stream arrete")
+        await reply_private(update, context, "Stream arrete")
     except Exception as e:
         logger.exception(f"Erreur dans stop_command: {e}")
-        await update.message.reply_text(f"Erreur: {e}")
+        await reply_private(update, context, f"Erreur: {e}")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_stream:
-        await update.message.reply_text(f"Stream actif: {current_stream['name']}")
+        await reply_private(update, context, f"Stream actif: {current_stream['name']}")
     else:
-        await update.message.reply_text("Aucun stream en cours")
+        await reply_private(update, context, "Aucun stream en cours")
 
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_stream, pytgcalls
 
     if not is_allowed_user(update.effective_user):
-        await update.message.reply_text("Non autorise")
+        await reply_private(update, context,"Non autorise")
         return
 
-    await update.message.reply_text("Demarrage du test...")
+    await reply_private(update, context, "Demarrage du test...")
     test_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
 
     try:
@@ -438,15 +448,15 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
         current_stream = {"id": "test", "name": "Big Buck Bunny (Test)", "url": test_url}
-        await update.message.reply_text("Stream de test demarre!")
+        await reply_private(update, context, "Stream de test demarre!")
     except Exception as e:
         logger.exception(f"Erreur dans test_command: {e}")
-        await update.message.reply_text(f"Erreur: {e}")
+        await reply_private(update, context, f"Erreur: {e}")
         current_stream = None
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await reply_private(update, context,
         "BingeBear TV Bot\n\n"
         "/start - Demarrer\n"
         "/categories - Categories IPTV\n"
@@ -462,11 +472,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Importer les messages du canal source depuis X jours (admin only)"""
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Non autorise (admin uniquement)")
+        await reply_private(update, context,"Non autorise (admin uniquement)")
         return
 
     if not HAS_USER_CLIENT or not user_client:
-        await update.message.reply_text("Erreur: client utilisateur non connecte (SESSION_STRING manquante)")
+        await reply_private(update, context,"Erreur: client utilisateur non connecte (SESSION_STRING manquante)")
         return
 
     # Nombre de jours (defaut: 7)
@@ -475,14 +485,14 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             days = int(context.args[0])
             if days < 1 or days > 30:
-                await update.message.reply_text("Nombre de jours entre 1 et 30")
+                await reply_private(update, context,"Nombre de jours entre 1 et 30")
                 return
         except ValueError:
-            await update.message.reply_text("Usage: /importnews <nombre_de_jours>\nExemple: /importnews 7")
+            await reply_private(update, context,"Usage: /importnews <nombre_de_jours>\nExemple: /importnews 7")
             return
 
     since_date = datetime.now() - timedelta(days=days)
-    await update.message.reply_text(f"Import des news depuis {days} jour(s)...\nCela peut prendre un moment.")
+    await reply_private(update, context, f"Import des news depuis {days} jour(s)...\nCela peut prendre un moment.")
 
     imported = 0
     skipped = 0
@@ -532,14 +542,14 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 # Pause anti-rate-limit
                 await asyncio.sleep(1.5)
 
-        await update.message.reply_text(
+        await reply_private(update, context,
             f"Import termine!\n"
             f"Messages importes: {imported}\n"
             f"Deja importes (ignores): {skipped}"
         )
     except Exception as e:
         logger.exception(f"Erreur dans importnews_command: {e}")
-        await update.message.reply_text(f"Erreur pendant l'import: {e}\nMessages importes avant erreur: {imported}")
+        await reply_private(update, context,f"Erreur pendant l'import: {e}\nMessages importes avant erreur: {imported}")
 
 
 async def auto_resume_stream():
