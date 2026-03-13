@@ -286,16 +286,22 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Aucune categorie disponible")
         return
 
-    text = "Categories disponibles:\n\n"
-    for cat in categories[:50]:
-        text += f"* {cat['id']} - {escape_markdown(cat['name'])}\n"
-    if len(categories) > 50:
-        text += f"\n... et {len(categories) - 50} autres\n"
-    text += f"\nTotal: {len(categories)}\nUtilisez /cat <id>"
+    # Envoyer toutes les categories en plusieurs messages si necessaire
+    header = f"Categories disponibles ({len(categories)}):\n\n"
+    current_msg = header
+    msg_count = 1
 
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    await update.message.reply_text(text)
+    for cat in categories:
+        line = f"* {cat['id']} - {escape_markdown(cat['name'])}\n"
+        # Si le message depasse 3800 caracteres, envoyer et recommencer
+        if len(current_msg) + len(line) > 3800:
+            await update.message.reply_text(current_msg)
+            msg_count += 1
+            current_msg = f"Categories (suite {msg_count}):\n\n"
+        current_msg += line
+
+    current_msg += f"\nTotal: {len(categories)}\nUtilisez /cat <id>"
+    await update.message.reply_text(current_msg)
 
 
 async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,16 +330,20 @@ async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Aucune chaine")
         return
 
-    text = f"{escape_markdown(category['name'])}\n\n"
-    for ch in channels[:30]:
-        text += f"* {ch['id']} - {escape_markdown(ch['name'])}\n"
-    if len(channels) > 30:
-        text += f"\n... et {len(channels) - 30} autres\n"
-    text += f"\nTotal: {len(channels)}\nUtilisez /play <id>"
+    header = f"{escape_markdown(category['name'])} ({len(channels)} chaines):\n\n"
+    current_msg = header
+    msg_count = 1
 
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    await update.message.reply_text(text)
+    for ch in channels:
+        line = f"* {ch['id']} - {escape_markdown(ch['name'])}\n"
+        if len(current_msg) + len(line) > 3800:
+            await update.message.reply_text(current_msg)
+            msg_count += 1
+            current_msg = f"Chaines (suite {msg_count}):\n\n"
+        current_msg += line
+
+    current_msg += f"\nTotal: {len(channels)}\nUtilisez /play <id>"
+    await update.message.reply_text(current_msg)
 
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
