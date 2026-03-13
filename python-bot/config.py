@@ -15,6 +15,10 @@ REQUIRED_VARS = [
     'API_HASH',
     'BOT_TOKEN',
     'CHAT_ID',
+]
+
+# Variables recommandees — le bot demarre sans elles mais avec des fonctions limitees
+RECOMMENDED_VARS = [
     'SESSION_STRING',
     'IPTV_SERVER_URL',
     'IPTV_USERNAME',
@@ -39,6 +43,12 @@ def validate_config():
         logger.critical("Verifiez votre fichier .env ou vos variables systeme.")
         sys.exit(1)
     logger.info("Configuration validee — toutes les variables requises sont presentes")
+
+    # Avertir pour les variables recommandees manquantes
+    missing_rec = [var for var in RECOMMENDED_VARS if not os.getenv(var)]
+    if missing_rec:
+        logger.warning(f"Variables recommandees manquantes : {', '.join(missing_rec)}")
+        logger.warning("Certaines fonctions (streaming, IPTV) seront desactivees.")
 
 
 def get_config(key, default=None):

@@ -69,19 +69,19 @@ NEWS_EXCLUDE_WORDS = [
 NEWS_REPLACE_TO = "Team BingeBearTV"
 
 # Client utilisateur Pyrogram (partage pour streaming et news)
-if SESSION_STRING:
+# Si pas de SESSION_STRING, le streaming et le news forwarder sont desactives
+if SESSION_STRING and SESSION_STRING != "votre_session_string_ici":
     user_client = Client(
         "combined_session",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING
     )
+    HAS_USER_CLIENT = True
 else:
-    user_client = Client(
-        "combined_session",
-        api_id=API_ID,
-        api_hash=API_HASH
-    )
+    user_client = None
+    HAS_USER_CLIENT = False
+    logger.warning("SESSION_STRING absente — streaming et news forwarder desactives")
 
 # Bot Telegram (pour envoyer les messages et commandes)
 telegram_bot = Bot(token=BOT_TOKEN)
@@ -136,7 +136,6 @@ def modify_news_message(text: str) -> str:
     return text.strip()
 
 
-@user_client.on_message(filters.chat(NEWS_SOURCE_CHANNEL))
 async def forward_news(client: Client, message: Message):
     """Intercepter et transferer les messages filtres (texte + images)"""
     text = message.text or message.caption or ""
@@ -192,6 +191,11 @@ async def forward_news(client: Client, message: Message):
             await news_queue.enqueue(send_text)
     else:
         logger.debug("Message news ignore")
+
+
+# Enregistrer le handler news seulement si le client utilisateur est disponible
+if HAS_USER_CLIENT and user_client:
+    user_client.on_message(filters.chat(NEWS_SOURCE_CHANNEL))(forward_news)
 
 
 # ============== STREAMING BOT FUNCTIONS ==============
@@ -511,32 +515,36 @@ async def post_init(application):
     """Initialiser pytgcalls apres le demarrage"""
     global pytgcalls
 
-    logger.info("Demarrage du client utilisateur...")
-    await user_client.start()
+    if HAS_USER_CLIENT and user_client:
+        logger.info("Demarrage du client utilisateur...")
+        await user_client.start()
 
-    me = await user_client.get_me()
-    logger.info(f"Connecte: {me.first_name} (@{me.username})")
+        me = await user_client.get_me()
+        logger.info(f"Connecte: {me.first_name} (@{me.username})")
 
-    pytgcalls = PyTgCalls(user_client)
-    await pytgcalls.start()
-    logger.info("PyTgCalls pret")
+        pytgcalls = PyTgCalls(user_client)
+        await pytgcalls.start()
+        logger.info("PyTgCalls pret")
+
+        logger.info(f"Ecoute canal source: {NEWS_SOURCE_CHANNEL}")
+        logger.info(f"Destination news: {NEWS_DEST_CHANNEL}")
+
+        # Demarrer la file d'attente news
+        await news_queue.start()
+
+        # Auto-resume du stream precedent si applicable
+        await auto_resume_stream()
+
+        # Lancer le watchdog en tache de fond
+        asyncio.create_task(stream_watchdog())
+    else:
+        logger.warning("Mode commandes uniquement (pas de streaming/news)")
 
     logger.info(f"Groupe cible: @{CHAT_ID}")
-    logger.info(f"Ecoute canal source: {NEWS_SOURCE_CHANNEL}")
-    logger.info(f"Destination news: {NEWS_DEST_CHANNEL}")
 
     # Démarrer le health check HTTP
     health_port = int(os.getenv("HEALTH_PORT", "8080"))
     await health.start(port=health_port)
-
-    # Demarrer la file d'attente news
-    await news_queue.start()
-
-    # Auto-resume du stream precedent si applicable
-    await auto_resume_stream()
-
-    # Lancer le watchdog en tache de fond
-    asyncio.create_task(stream_watchdog())
 
 
 def main():
