@@ -140,18 +140,21 @@ def modify_news_message(text: str) -> str:
 
 async def forward_news(client: Client, message: Message):
     """Intercepter et transferer les messages filtres (texte + images)"""
+    logger.info(f"[NEWS] Message recu: chat_id={message.chat.id}, msg_id={message.id}, text={repr((message.text or message.caption or '')[:80])}")
+
     text = message.text or message.caption or ""
 
     if not text:
+        logger.debug(f"[NEWS] Message {message.id} sans texte, ignore")
         return
 
     # Verifier le cache anti-doublons
     if news_cache.is_forwarded(message.id):
-        logger.debug(f"Message {message.id} deja transfere (cache), ignore")
+        logger.debug(f"[NEWS] Message {message.id} deja transfere (cache), ignore")
         return
 
     if should_forward_news(text):
-        logger.info(f"Message news detecte! (id={message.id})")
+        logger.info(f"[NEWS] Message {message.id} accepte pour transfert")
         logger.debug(f"Apercu: {text[:100]}...")
 
         modified_text = modify_news_message(text)
@@ -192,7 +195,7 @@ async def forward_news(client: Client, message: Message):
 
             await news_queue.enqueue(send_text)
     else:
-        logger.debug("Message news ignore")
+        logger.debug(f"[NEWS] Message {message.id} ne matche pas les patterns, ignore")
 
 
 # Enregistrer le handler news seulement si le client utilisateur est disponible
@@ -275,7 +278,7 @@ async def reply_private(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         await context.bot.send_message(chat_id=user_id, text=text)
     except Exception:
         # Fallback: si le bot ne peut pas envoyer en DM (l'utilisateur n'a pas /start en prive)
-        await reply_private(update, context,text)
+        await update.message.reply_text(text)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,8 +635,22 @@ async def post_init(application):
         await pytgcalls.start()
         logger.info("PyTgCalls pret")
 
+        # Verifier l'acces au canal source
+        try:
+            chat = await user_client.get_chat(NEWS_SOURCE_CHANNEL)
+            logger.info(f"Canal source accessible: {chat.title} (id={chat.id})")
+            try:
+                member = await user_client.get_chat_member(NEWS_SOURCE_CHANNEL, "me")
+                logger.info(f"Statut dans le canal source: {member.status}")
+            except Exception as e:
+                logger.warning(f"Impossible de verifier le statut membre: {e}")
+        except Exception as e:
+            logger.error(f"IMPOSSIBLE d'acceder au canal source {NEWS_SOURCE_CHANNEL}: {e}")
+            logger.error("Le compte doit etre ABONNE au canal source pour recevoir les updates!")
+
         logger.info(f"Ecoute canal source: {NEWS_SOURCE_CHANNEL}")
         logger.info(f"Destination news: {NEWS_DEST_CHANNEL}")
+        logger.info(f"Handlers Pyrogram enregistres: {len(user_client.dispatcher.groups)}")
 
         # Demarrer la file d'attente news
         await news_queue.start()
