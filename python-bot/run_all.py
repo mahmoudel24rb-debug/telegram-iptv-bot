@@ -28,6 +28,7 @@ from health import HealthCheck
 from stream_state import save_state, load_state, clear_state
 from news_cache import NewsCache
 from news_queue import NewsQueue
+from reminders import load_reminders, add_reminder, delete_reminder, get_due_reminders, mark_sent, parse_interval, format_interval
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -468,6 +469,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stop - Arreter\n"
         "/status - Statut\n"
         "/test - Test\n"
+        "/announcement <msg> - Poster dans le canal (admin)\n"
+        "/reminder <intervalle> <msg> - Rappel recurrent (admin)\n"
+        "/reminders - Liste des rappels (admin)\n"
+        "/delreminder <id> - Supprimer rappel (admin)\n"
         "/importnews <jours> - Importer les news (admin)"
     )
 
@@ -553,6 +558,114 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.exception(f"Erreur dans importnews_command: {e}")
         await reply_private(update, context,f"Erreur pendant l'import: {e}\nMessages importes avant erreur: {imported}")
+
+
+async def announcement_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Poster un message dans le canal comme si c'etait le bot/canal"""
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not context.args:
+        await reply_private(update, context, "Usage: /announcement <message>\nExemple: /announcement Bienvenue sur BingeBear TV!")
+        return
+
+    text = " ".join(context.args)
+
+    try:
+        await context.bot.send_message(chat_id=NEWS_DEST_CHANNEL, text=text)
+        await reply_private(update, context, "Annonce envoyee dans le canal.")
+        logger.info(f"[ANNOUNCEMENT] Message envoye par {update.effective_user.id}: {text[:80]}")
+    except Exception as e:
+        logger.exception(f"Erreur dans announcement_command: {e}")
+        await reply_private(update, context, f"Erreur: {e}")
+
+
+async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creer un rappel recurrent"""
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if len(context.args) < 2:
+        await reply_private(update, context,
+            "Usage: /reminder <intervalle> <message>\n\n"
+            "Intervalles: 30m, 12h, 36h, 48h, 2d, 7d\n\n"
+            "Exemples:\n"
+            "/reminder 36h Pensez a renouveler votre abonnement!\n"
+            "/reminder 2d Nouveaux canaux disponibles!"
+        )
+        return
+
+    interval_secs = parse_interval(context.args[0])
+    if interval_secs is None:
+        await reply_private(update, context, "Intervalle invalide. Utilisez: 30m, 12h, 36h, 48h, 2d...")
+        return
+
+    message = " ".join(context.args[1:])
+    rid = add_reminder(message, interval_secs)
+
+    await reply_private(update, context,
+        f"Rappel cree!\n"
+        f"ID: {rid}\n"
+        f"Intervalle: {format_interval(interval_secs)}\n"
+        f"Message: {message}"
+    )
+    logger.info(f"[REMINDER] Rappel {rid} cree par {update.effective_user.id}: intervalle={format_interval(interval_secs)}")
+
+
+async def reminders_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lister tous les rappels actifs"""
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    reminders = load_reminders()
+    if not reminders:
+        await reply_private(update, context, "Aucun rappel actif.")
+        return
+
+    lines = ["Rappels actifs:\n"]
+    for rid, data in reminders.items():
+        interval_str = format_interval(data["interval"])
+        lines.append(f"- ID: {rid} | {interval_str}\n  {data['message']}")
+
+    await reply_private(update, context, "\n".join(lines))
+
+
+async def delreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Supprimer un rappel"""
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not context.args:
+        await reply_private(update, context, "Usage: /delreminder <id>")
+        return
+
+    rid = context.args[0]
+    if delete_reminder(rid):
+        await reply_private(update, context, f"Rappel {rid} supprime.")
+        logger.info(f"[REMINDER] Rappel {rid} supprime par {update.effective_user.id}")
+    else:
+        await reply_private(update, context, f"Rappel {rid} introuvable.")
+
+
+async def reminder_worker(bot):
+    """Tache de fond: envoyer les rappels echus"""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            due = get_due_reminders()
+            for rid, data in due:
+                try:
+                    await bot.send_message(chat_id=NEWS_DEST_CHANNEL, text=data["message"])
+                    mark_sent(rid)
+                    logger.info(f"[REMINDER] Rappel {rid} envoye")
+                except Exception as e:
+                    logger.error(f"[REMINDER] Erreur envoi rappel {rid}: {e}")
+        except Exception as e:
+            logger.error(f"[REMINDER] Erreur worker: {e}")
 
 
 async def auto_resume_stream():
@@ -663,6 +776,9 @@ async def post_init(application):
     else:
         logger.warning("Mode commandes uniquement (pas de streaming/news)")
 
+    # Lancer le worker de rappels (independant du user_client)
+    asyncio.create_task(reminder_worker(application.bot))
+
     logger.info(f"Groupe cible: @{CHAT_ID}")
 
     # Démarrer le health check HTTP
@@ -690,6 +806,10 @@ def main():
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("importnews", importnews_command))
+    application.add_handler(CommandHandler("announcement", announcement_command))
+    application.add_handler(CommandHandler("reminder", reminder_command))
+    application.add_handler(CommandHandler("reminders", reminders_list_command))
+    application.add_handler(CommandHandler("delreminder", delreminder_command))
 
     logger.info("Bot pret!")
 
