@@ -668,6 +668,58 @@ async def reminder_worker(bot):
             logger.error(f"[REMINDER] Erreur worker: {e}")
 
 
+NEWS_POLL_INTERVAL = int(os.getenv("NEWS_POLL_INTERVAL", "7200"))  # 2h par defaut
+
+
+async def news_poll_worker():
+    """Tache de fond: importer les news automatiquement toutes les 2h"""
+    while True:
+        await asyncio.sleep(NEWS_POLL_INTERVAL)
+        if not HAS_USER_CLIENT or not user_client:
+            continue
+        try:
+            since_date = datetime.now() - timedelta(hours=3)
+            imported = 0
+            async for message in user_client.get_chat_history(NEWS_SOURCE_CHANNEL):
+                if message.date.replace(tzinfo=None) < since_date:
+                    break
+                text = message.text or message.caption or ""
+                if not text:
+                    continue
+                if news_cache.is_forwarded(message.id):
+                    continue
+                if should_forward_news(text):
+                    modified_text = modify_news_message(text)
+                    if message.photo:
+                        photo_path = await message.download()
+                        try:
+                            with open(photo_path, 'rb') as photo_file:
+                                await telegram_bot.send_photo(
+                                    chat_id=NEWS_DEST_CHANNEL,
+                                    photo=photo_file,
+                                    caption=modified_text
+                                )
+                        finally:
+                            try:
+                                os.remove(photo_path)
+                            except OSError:
+                                pass
+                    else:
+                        await telegram_bot.send_message(
+                            chat_id=NEWS_DEST_CHANNEL,
+                            text=modified_text
+                        )
+                    news_cache.mark_forwarded(message.id)
+                    imported += 1
+                    await asyncio.sleep(1.5)
+            if imported > 0:
+                logger.info(f"[NEWS-POLL] {imported} message(s) importe(s)")
+            else:
+                logger.debug("[NEWS-POLL] Aucun nouveau message")
+        except Exception as e:
+            logger.error(f"[NEWS-POLL] Erreur: {e}")
+
+
 async def auto_resume_stream():
     """Reprendre le stream précédent si un état sauvegardé existe."""
     global current_stream
@@ -773,6 +825,10 @@ async def post_init(application):
 
         # Lancer le watchdog en tache de fond
         asyncio.create_task(stream_watchdog())
+
+        # Lancer le polling auto des news toutes les 2h
+        asyncio.create_task(news_poll_worker())
+        logger.info(f"[NEWS-POLL] Auto-import actif (toutes les {NEWS_POLL_INTERVAL}s)")
     else:
         logger.warning("Mode commandes uniquement (pas de streaming/news)")
 
