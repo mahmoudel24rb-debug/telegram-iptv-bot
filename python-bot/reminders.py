@@ -9,7 +9,7 @@ import time
 import uuid
 import re
 
-REMINDERS_FILE = os.getenv("REMINDERS_FILE", "./reminders.json")
+REMINDERS_FILE = os.getenv("REMINDERS_FILE", os.path.join(os.path.dirname(__file__), "reminders.json"))
 
 
 def load_reminders() -> dict:

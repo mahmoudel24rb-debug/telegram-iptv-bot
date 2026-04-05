@@ -157,7 +157,10 @@ async def process_news_message(raw_text: str) -> tuple:
     Returns:
         (should_forward, modified_text, category)
     """
+    global _claude_calls_total
+
     # ── Tentative Claude API ──
+    _claude_calls_total += 1
     result = await process_message(raw_text)
 
     if result is not None:
@@ -226,6 +229,8 @@ async def forward_news(client: Client, message: Message):
                 except OSError:
                     pass
         else:
+            msg_id = message.id
+
             async def send_text():
                 await telegram_bot.send_message(
                     chat_id=NEWS_DEST_CHANNEL,
@@ -233,10 +238,12 @@ async def forward_news(client: Client, message: Message):
                 )
                 logger.info(f"[NEWS-RT] Message envoye vers {NEWS_DEST_CHANNEL}")
                 health.last_news_forwarded = time.time()
+                news_cache.mark_forwarded(msg_id)
 
             await news_queue.enqueue(send_text)
+            return  # mark_forwarded sera appele dans le callback
 
-    # Cacher dans tous les cas (transfere ou non)
+    # Cacher dans tous les cas (transfere via photo ou non transfere)
     news_cache.mark_forwarded(message.id)
 
 
@@ -261,15 +268,19 @@ def is_allowed_user(user):
     return False
 
 
-def get_categories():
+def _fetch_categories_sync():
+    url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_categories"
+    response = retry_sync(
+        lambda: requests.get(url, headers=HEADERS, timeout=30),
+        description='chargement categories IPTV'
+    )
+    return response.json()
+
+
+async def get_categories():
     global categories_cache
     try:
-        url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_categories"
-        response = retry_sync(
-            lambda: requests.get(url, headers=HEADERS, timeout=30),
-            description='chargement categories IPTV'
-        )
-        categories = response.json()
+        categories = await asyncio.to_thread(_fetch_categories_sync)
         categories_cache = [{"id": cat["category_id"], "name": cat["category_name"]} for cat in categories]
         return categories_cache
     except Exception as e:
@@ -277,15 +288,19 @@ def get_categories():
         return []
 
 
-def get_channels_by_category(category_id):
+def _fetch_channels_sync(category_id):
+    url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_streams&category_id={category_id}"
+    response = retry_sync(
+        lambda: requests.get(url, headers=HEADERS, timeout=30),
+        description=f'chargement chaines categorie {category_id}'
+    )
+    return response.json()
+
+
+async def get_channels_by_category(category_id):
     global channels_cache
     try:
-        url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_streams&category_id={category_id}"
-        response = retry_sync(
-            lambda: requests.get(url, headers=HEADERS, timeout=30),
-            description=f'chargement chaines categorie {category_id}'
-        )
-        channels = response.json()
+        channels = await asyncio.to_thread(_fetch_channels_sync, category_id)
         channels_list = [
             {"id": ch["stream_id"], "name": ch["name"], "category_id": category_id,
              "url": f"{IPTV_SERVER}/live/{IPTV_USER}/{IPTV_PASS}/{ch['stream_id']}.ts"}
@@ -313,22 +328,31 @@ def escape_markdown(text):
     return text
 
 
+def _is_duplicate_update(update: Update) -> bool:
+    """Detecter les messages auto-forwarded depuis un channel lie (cause de doublons)."""
+    if not update.effective_user:
+        return True
+    if update.message and update.message.is_automatic_forward:
+        return True
+    return False
+
+
 async def reply_private(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Envoyer la reponse en prive a l'utilisateur (jamais dans le canal)"""
     if not update.effective_user:
-        return
-    # Ignorer les messages auto-forwarded depuis un channel (evite les doublons)
-    if update.message and update.message.is_automatic_forward:
         return
     user_id = update.effective_user.id
     try:
         await context.bot.send_message(chat_id=user_id, text=text)
     except Exception:
         # Fallback: si le bot ne peut pas envoyer en DM (l'utilisateur n'a pas /start en prive)
-        await update.message.reply_text(text)
+        if update.message:
+            await update.message.reply_text(text)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_duplicate_update(update):
+        return
     await reply_private(update, context,
         "BingeBear TV - Live Streaming Bot\n\n"
         "Commandes:\n"
@@ -342,8 +366,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_duplicate_update(update):
+        return
     await reply_private(update, context, "Chargement des categories...")
-    categories = get_categories()
+    categories = await get_categories()
     if not categories:
         await reply_private(update, context, "Aucune categorie disponible")
         return
@@ -367,13 +393,15 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_duplicate_update(update):
+        return
     if not context.args:
         await reply_private(update, context, "Usage: /cat <category_id>")
         return
 
     category_id = context.args[0]
     if not categories_cache:
-        get_categories()
+        await get_categories()
 
     category = None
     for cat in categories_cache:
@@ -386,7 +414,7 @@ async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await reply_private(update, context, f"Chargement de {category['name']}...")
-    channels = get_channels_by_category(category_id)
+    channels = await get_channels_by_category(category_id)
 
     if not channels:
         await reply_private(update, context, "Aucune chaine")
@@ -411,6 +439,11 @@ async def cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_stream, pytgcalls
 
+    if _is_duplicate_update(update):
+        return
+    if not pytgcalls:
+        await reply_private(update, context, "Streaming non disponible (SESSION_STRING manquante)")
+        return
     if not is_allowed_user(update.effective_user):
         await reply_private(update, context, "Non autorise")
         return
@@ -454,6 +487,11 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_stream, pytgcalls
 
+    if _is_duplicate_update(update):
+        return
+    if not pytgcalls:
+        await reply_private(update, context, "Streaming non disponible")
+        return
     if not is_allowed_user(update.effective_user):
         await reply_private(update, context, "Non autorise")
         return
@@ -470,6 +508,8 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_duplicate_update(update):
+        return
     if current_stream:
         await reply_private(update, context, f"Stream actif: {current_stream['name']}")
     else:
@@ -479,6 +519,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_stream, pytgcalls
 
+    if _is_duplicate_update(update):
+        return
+    if not pytgcalls:
+        await reply_private(update, context, "Streaming non disponible (SESSION_STRING manquante)")
+        return
     if not is_allowed_user(update.effective_user):
         await reply_private(update, context,"Non autorise")
         return
@@ -506,6 +551,8 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_duplicate_update(update):
+        return
     await reply_private(update, context,
         "BingeBear TV Bot\n\n"
         "/start - Demarrer\n"
@@ -525,6 +572,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Importer les messages du canal source depuis X jours (admin only)"""
+    if _is_duplicate_update(update):
+        return
     if not is_admin(update.effective_user.id):
         await reply_private(update, context,"Non autorise (admin uniquement)")
         return
@@ -614,6 +663,8 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def announcement_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Poster un message dans le canal comme si c'etait le bot/canal"""
+    if _is_duplicate_update(update):
+        return
     if not is_admin(update.effective_user.id):
         await reply_private(update, context, "Non autorise (admin uniquement)")
         return
@@ -635,6 +686,8 @@ async def announcement_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Creer un rappel recurrent"""
+    if _is_duplicate_update(update):
+        return
     if not is_admin(update.effective_user.id):
         await reply_private(update, context, "Non autorise (admin uniquement)")
         return
@@ -668,6 +721,8 @@ async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reminders_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lister tous les rappels actifs"""
+    if _is_duplicate_update(update):
+        return
     if not is_admin(update.effective_user.id):
         await reply_private(update, context, "Non autorise (admin uniquement)")
         return
@@ -687,6 +742,8 @@ async def reminders_list_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def delreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Supprimer un rappel"""
+    if _is_duplicate_update(update):
+        return
     if not is_admin(update.effective_user.id):
         await reply_private(update, context, "Non autorise (admin uniquement)")
         return
@@ -706,6 +763,8 @@ async def delreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def testlistener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tester si le handler on_message Pyrogram fonctionne"""
     global _listener_test_event, _listener_test_start
+    if _is_duplicate_update(update):
+        return
     if not is_admin(update.effective_user.id):
         await reply_private(update, context, "Non autorise (admin uniquement)")
         return
@@ -751,10 +810,13 @@ async def reminder_worker(bot):
 
 
 NEWS_POLL_INTERVAL = int(os.getenv("NEWS_POLL_INTERVAL", "7200"))  # 2h par defaut
+CLAUDE_MAX_CALLS_PER_CYCLE = int(os.getenv("CLAUDE_MAX_CALLS_PER_CYCLE", "50"))  # Limite par cycle de poll
+_claude_calls_total = 0
 
 
 async def news_poll_worker():
     """Auto-import avec regroupement intelligent des messages."""
+    global _claude_calls_total
     while True:
         await asyncio.sleep(NEWS_POLL_INTERVAL)
         if not HAS_USER_CLIENT or not user_client:
@@ -855,7 +917,7 @@ async def news_poll_worker():
                         news_cache.mark_forwarded(m["id"])
                         await asyncio.sleep(1.5 if should_fwd else 0.5)
 
-            logger.info(f"[NEWS-POLL] Cycle termine: {imported} envoye(s) depuis {len(pending_messages)} message(s)")
+            logger.info(f"[NEWS-POLL] Cycle termine: {imported} envoye(s) depuis {len(pending_messages)} message(s) | appels Claude total: {_claude_calls_total}")
 
         except Exception as e:
             logger.error(f"[NEWS-POLL] Erreur: {e}")

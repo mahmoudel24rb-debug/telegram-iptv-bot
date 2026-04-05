@@ -31,12 +31,7 @@
 
 Le bot tourne 24/7 sur un VPS OVH (Ubuntu 25.04) via un service systemd avec auto-restart.
 
-**Identifiants du projet** :
-- Bot : `@Bingebear_tv_bot` (ID: 8500861189)
-- Compte utilisateur Pyrogram : DeFi Mack (`@DefiMack`, ID: 1540634249)
-- Canal source des news : `SERVICE INFORMATION` (ID: -1001763758614)
-- Canal de destination : `@bingebeartv_live`
-- VPS : OVH Ubuntu 25.04, IP 137.74.42.174, user `ubuntu`
+**Identifiants du projet** : configures via variables d'environnement (voir section 11).
 
 ---
 
@@ -635,26 +630,26 @@ def is_allowed_user(user):
 
 ### Obligatoires
 ```env
-API_ID=33417585                              # ID application Telegram (my.telegram.org)
-API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx    # Hash application Telegram
-BOT_TOKEN=xxxxxxxxxx:xxxxxxxxxxxxxxxxxxx    # Token du bot (@BotFather)
-CHAT_ID=bingebeartv_live                     # Username du groupe/canal cible (sans @)
+API_ID=<votre_api_id>                        # ID application Telegram (my.telegram.org)
+API_HASH=<votre_api_hash>                    # Hash application Telegram
+BOT_TOKEN=<votre_bot_token>                  # Token du bot (@BotFather)
+CHAT_ID=<votre_channel_username>             # Username du groupe/canal cible (sans @)
 ```
 
 ### Recommandees (necessaires pour streaming + news)
 ```env
-SESSION_STRING=BAH96XEA...                   # Session Pyrogram (generate_session.py)
+SESSION_STRING=<session_pyrogram>             # Session Pyrogram (generate_session.py)
 IPTV_SERVER_URL=http://...                   # URL du serveur IPTV Xtream Codes
-IPTV_USERNAME=...                            # Identifiant IPTV
-IPTV_PASSWORD=...                            # Mot de passe IPTV
+IPTV_USERNAME=<iptv_user>                    # Identifiant IPTV
+IPTV_PASSWORD=<iptv_pass>                    # Mot de passe IPTV
 ```
 
 ### Optionnelles
 ```env
-ADMIN_IDS=1540634249                         # IDs Telegram des admins
-ALLOWED_USERNAMES=DefiMack                   # Usernames autorises pour le streaming
-NEWS_SOURCE_CHANNEL=-1001763758614           # ID du canal source des news
-NEWS_DEST_CHANNEL=@bingebeartv_live          # Canal de destination des news
+ADMIN_IDS=<telegram_user_ids>                # IDs Telegram des admins (virgules)
+ALLOWED_USERNAMES=<usernames>                # Usernames autorises pour le streaming
+NEWS_SOURCE_CHANNEL=<channel_id>             # ID du canal source des news
+NEWS_DEST_CHANNEL=@<channel_username>        # Canal de destination des news
 NEWS_POLL_INTERVAL=7200                      # Intervalle polling news en secondes (defaut 2h)
 LOG_DIR=/var/log/bingebear                   # Repertoire des logs
 HEALTH_PORT=8080                             # Port du serveur health check
@@ -676,7 +671,7 @@ STREAM_STATE_MAX_AGE=1800                    # Duree max etat sauvegarde (30 min
 
 ### Ancien deploiement (expire)
 
-Le bot tournait sur un VPS OVH Ubuntu 25.04 (IP: 137.74.42.174) via systemd. Le VPS a expire en mars 2026 et n'est plus accessible. Migration vers Railway effectuee le 05/04/2026.
+Le bot tournait sur un VPS OVH Ubuntu 25.04 via systemd. Le VPS a expire et n'est plus accessible. Migration vers Railway effectuee en avril 2026.
 
 ### Deploiement via Railway CLI
 
