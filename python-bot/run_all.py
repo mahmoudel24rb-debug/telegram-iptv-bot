@@ -151,33 +151,41 @@ async def process_news_message(raw_text: str) -> tuple:
     """
     Traite un message news : decide s'il faut le transferer et le reecrit.
 
-    Utilise Claude API en priorite, fallback sur le filtrage regex si l'API
-    est indisponible ou en erreur.
+    Strategie :
+    1. Si le message matche les patterns regex connus → traitement regex direct (pas d'appel API)
+    2. Si le message est exclu par les mots interdits → skip direct (pas d'appel API)
+    3. Sinon → appel Claude API pour les messages ambigus (pannes, urgences, etc.)
+    4. Si Claude est indisponible → skip (les patterns connus sont deja traites en 1)
 
     Returns:
         (should_forward, modified_text, category)
     """
     global _claude_calls_total
 
-    # ── Tentative Claude API ──
+    # ── Etape 1 : Exclusion rapide (mots interdits) ──
+    for exclude in NEWS_EXCLUDE_WORDS:
+        if exclude.lower() in raw_text.lower():
+            return False, None, "excluded"
+
+    # ── Etape 2 : Match regex connu → traitement direct sans Claude ──
+    if should_forward_news(raw_text):
+        modified = modify_news_message(raw_text)
+        logger.info("[NEWS] Message matche pattern regex — traitement direct (pas d'appel Claude)")
+        return True, modified, "regex_match"
+
+    # ── Etape 3 : Message ambigu → appel Claude API ──
     _claude_calls_total += 1
     result = await process_message(raw_text)
 
     if result is not None:
-        # Claude a repondu — utiliser sa decision
         if result["should_forward"] and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD:
             return True, result["rewritten_message"], result["category"]
         else:
             return False, None, result.get("category")
 
-    # ── Fallback regex (Claude indisponible) ──
-    logger.warning("[NEWS] Claude API indisponible — fallback regex")
-
-    if not should_forward_news(raw_text):
-        return False, None, None
-
-    modified = modify_news_message(raw_text)
-    return True, modified, "unknown"
+    # ── Claude indisponible et pas de match regex → skip ──
+    logger.debug("[NEWS] Pas de match regex et Claude indisponible — skip")
+    return False, None, None
 
 
 async def forward_news(client: Client, message: Message):
