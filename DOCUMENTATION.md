@@ -13,9 +13,9 @@
 9. [Modules auxiliaires](#9-modules-auxiliaires)
 10. [Authentification et autorisation](#10-authentification-et-autorisation)
 11. [Variables d'environnement](#11-variables-denvironnement)
-12. [Deploiement VPS](#12-deploiement-vps)
+12. [Deploiement Railway](#12-deploiement-railway)
 13. [Diagnostic et debugging](#13-diagnostic-et-debugging)
-14. [Bug connu : on_message ne se declenche pas](#14-bug-connu--on_message-ne-se-declenche-pas)
+14. [Bugs connus](#14-bugs-connus)
 15. [Historique des modifications](#15-historique-des-modifications)
 
 ---
@@ -663,55 +663,70 @@ STREAM_STATE_MAX_AGE=1800                    # Duree max etat sauvegarde (30 min
 
 ---
 
-## 12. Deploiement VPS
+## 12. Deploiement Railway
 
-### Configuration actuelle
+### Configuration actuelle (avril 2026)
 
-- **Serveur** : OVH VPS Ubuntu 25.04 (vps-5f6c616f.vps.ovh.net, IP: 137.74.42.174)
-- **Utilisateur** : `ubuntu`
-- **Python** : 3.13 (natif Ubuntu 25.04)
-- **Connexion SSH** : `ssh ubuntu@137.74.42.174` (cle SSH, pas de mot de passe)
+- **Plateforme** : Railway.app (Docker)
+- **Projet** : bingebear-telegram-bot
+- **Region** : US West (California)
+- **Replicas** : 1
+- **Dockerfile** : `python-bot/Dockerfile` (Python 3.11-slim + FFmpeg)
+- **GitHub** : https://github.com/mahmoudel24rb-debug/telegram-iptv-bot
 
-### Service systemd
+### Ancien deploiement (expire)
 
-Fichier : `/etc/systemd/system/bingebear-bot.service`
+Le bot tournait sur un VPS OVH Ubuntu 25.04 (IP: 137.74.42.174) via systemd. Le VPS a expire en mars 2026 et n'est plus accessible. Migration vers Railway effectuee le 05/04/2026.
 
-```ini
-[Unit]
-Description=BingeBear TV Bot
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/TelegramIPTVBot/python-bot
-ExecStart=/home/ubuntu/TelegramIPTVBot/python-bot/venv/bin/python run_all.py
-Restart=always
-RestartSec=10
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Commandes de gestion
+### Deploiement via Railway CLI
 
 ```bash
-# Statut
-sudo systemctl status bingebear-bot
+# Installer le CLI
+npm install -g @railway/cli
 
-# Redemarrer
-sudo systemctl restart bingebear-bot
+# Se connecter
+railway login
 
-# Logs en temps reel
-sudo journalctl -u bingebear-bot -f
+# Depuis le dossier python-bot/
+cd python-bot
+railway init
+railway up
 
-# Derniers 50 logs
-sudo journalctl -u bingebear-bot -n 50 --no-pager
+# Lier un service
+railway service
 
-# Mise a jour du bot
-cd ~/TelegramIPTVBot && git pull origin main && sudo systemctl restart bingebear-bot
+# Ajouter/modifier des variables
+railway variables set "NOM=VALEUR"
+
+# Voir les logs
+railway logs
 ```
+
+### Variables d'environnement (dans Railway dashboard > Variables)
+
+Toutes les variables sont configurees dans l'interface Railway, pas dans un fichier .env local.
+
+### Dockerfile utilise
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libavcodec-extra curl
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN mkdir -p /var/log/bingebear
+EXPOSE 8080
+CMD ["python", "run_all.py"]
+```
+
+### Mise a jour du bot
+
+```bash
+cd python-bot
+railway up
+```
+Railway rebuild le Docker et redeploit automatiquement.
 
 ---
 
@@ -776,27 +791,37 @@ sudo journalctl -u bingebear-bot --since "today" | grep -i "error"
 
 ---
 
-## 14. Bug connu : on_message ne se declenche pas
+## 14. Bugs connus
 
-### Description du probleme
+### 14.1 Bug on_message Pyrogram — ne se declenche pas
 
-Le handler Pyrogram `on_message(filters.chat(NEWS_SOURCE_CHANNEL))` ne se declenche JAMAIS quand un nouveau message arrive dans le canal source. Pourtant :
+**Description** : Le handler Pyrogram `on_message(filters.chat(NEWS_SOURCE_CHANNEL))` ne se declenche JAMAIS quand un nouveau message arrive dans le canal source.
 
+**Ce qui fonctionne** :
 - Le compte est bien abonne au canal (ChatMemberStatus.MEMBER)
 - Le handler est bien enregistre (2 handlers Pyrogram actifs)
 - `get_chat_history()` fonctionne parfaitement (prouve par /importnews)
 - Le filtre utilise bien un INT (-1001763758614)
 - `user_client.start()` est bien appele dans `post_init()`
 
-### Hypotheses non confirmees
+**Fix tente** : Remplacement de `run_polling()` (bloquant) par un demarrage manuel de la boucle asyncio (`application.start()` + `updater.start_polling()`) pour que PTB et Pyrogram partagent le meme event loop. Le fix est deploye mais non encore confirme comme fonctionnel — la commande `/testlistener` a ete ajoutee pour diagnostiquer.
 
-1. **Conflit de boucle evenementielle** : `run_polling()` de python-telegram-bot est bloquant et prend le controle de la boucle asyncio. Pyrogram pourrait ne pas recevoir ses updates dans cette configuration.
+**Workaround en place** : `news_poll_worker` toutes les 2 heures qui utilise `get_chat_history()` (appel actif pull) au lieu de `on_message` (ecoute passive push).
 
-2. **Probleme avec pyrofork** : La version pyrofork 2.3.58 pourrait avoir un bug avec les handlers `on_message` sur les canaux.
+### 14.2 Bug reponses en double
 
-3. **Pas de `idle()`** : Pyrogram a normalement besoin de `idle()` pour maintenir la connexion active, mais dans notre cas `run_polling()` maintient la boucle.
+**Description** : Quand un utilisateur envoie une commande (ex: `/help`) dans le channel `@bingebeartv_live`, le bot repond 2 fois en DM prive.
 
-### Workaround en place
+**Cause probable** : Le canal Telegram est lie a un groupe de discussion. Quand un message est poste dans le canal, Telegram le forward automatiquement dans le groupe lie. Le bot recoit donc le message 2 fois : une fois du canal, une fois du groupe (auto-forward). Les deux declenchent le handler de commande.
+
+**Fix tente** : 
+- Restriction de `allowed_updates` a `["message"]` au lieu de `Update.ALL_TYPES`
+- Ajout de `drop_pending_updates=True` au demarrage du polling
+- Ajout d'un check `update.message.is_automatic_forward` dans `reply_private()` pour ignorer les messages auto-forwarded
+
+**Statut** : Fix deploye, en attente de confirmation.
+
+### Workaround en place (pour les deux bugs)
 
 Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `get_chat_history()` (appel actif) au lieu de `on_message` (ecoute passive). Ce workaround fonctionne et est fiable.
 
@@ -806,6 +831,7 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 | Commit | Description |
 |--------|-------------|
+| `3ac10b6` | Refonte news: integration Claude API + fix asyncio on_message + /testlistener |
 | `892d826` | Ajout auto-import des news toutes les 2h (news_poll_worker) comme fallback du on_message |
 | `544f690` | Ajout commandes /announcement et /reminder pour gestion admin du canal |
 | `434c9b2` | Mise a jour documentation avec logs de diagnostic |
@@ -818,6 +844,25 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 ---
 
+## 16. Nouveautes : Integration Claude API (claude_processor.py)
+
+### Description
+
+Nouveau module optionnel qui remplace le filtrage regex par l'API Claude (Anthropic) pour analyser et reecrire les messages de news. Necessite la variable `ANTHROPIC_API_KEY`.
+
+### Fonctionnement
+
+1. Chaque message du canal source est envoye a Claude API avec un prompt systeme specifique
+2. Claude analyse le message et decide : FORWARD (transferer), SKIP (ignorer), ou URGENT (prioritaire)
+3. Si FORWARD ou URGENT : Claude reecrit le message avec le branding BingeBear TV
+4. Si l'API est indisponible ou la cle absente : fallback automatique sur l'ancien systeme regex
+
+### Fallback
+
+Les anciennes fonctions `should_forward_news()` et `modify_news_message()` sont conservees. Si `ANTHROPIC_API_KEY` n'est pas configuree, le bot utilise automatiquement le systeme regex comme avant.
+
+---
+
 ## Points d'attention
 
 1. **SESSION_STRING** : Indispensable pour le streaming ET le transfert de news. Sans elle, le bot ne peut que repondre aux commandes basiques. Generee via `generate_session.py`.
@@ -826,10 +871,12 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 3. **Rate limiting** : Telegram limite a ~30 msg/sec par canal. Le bot espace les envois de 1.5s. L'erreur 429 est geree automatiquement.
 
-4. **Port 8080** : Utilise par le health check. Les erreurs `BadHttpMessage` dans les logs viennent de scanners internet — c'est du bruit, pas un probleme.
+4. **DM prives** : L'utilisateur doit avoir fait `/start` en prive avec le bot au moins une fois pour recevoir les reponses.
 
-5. **DM prives** : L'utilisateur doit avoir fait `/start` en prive avec le bot au moins une fois pour recevoir les reponses.
+5. **Fichiers de persistance** : `news_cache.json`, `stream_state.json` et `reminders.json` sont crees automatiquement dans le working directory et survivent aux redemarrages.
 
-6. **Fichiers de persistance** : `news_cache.json`, `stream_state.json` et `reminders.json` sont crees automatiquement dans le working directory et survivent aux redemarrages.
+6. **Deploiement Railway** : Le bot tourne sur Railway.app via Docker. Les variables d'environnement sont gerees dans le dashboard Railway, pas dans un fichier .env.
 
-7. **Bug on_message** : Le transfert automatique en temps reel ne fonctionne pas. Le workaround (polling toutes les 2h) est en place et fiable. Le delai maximum entre un message dans le canal source et sa publication dans @bingebeartv_live est donc de 2 heures.
+7. **Bug reponses en double** : Quand une commande est envoyee dans le channel (pas en DM prive au bot), le bot repond 2 fois. Cause probable : canal lie a un groupe de discussion, Telegram forward automatiquement le message. Fix en cours (check `is_automatic_forward`).
+
+8. **Bug on_message** : Le transfert automatique en temps reel n'est pas confirme fonctionnel. Le workaround (polling toutes les 2h via news_poll_worker) est en place et fiable. Delai max entre un message source et sa publication : 2 heures.

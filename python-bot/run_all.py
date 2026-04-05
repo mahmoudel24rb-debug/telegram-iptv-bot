@@ -315,6 +315,11 @@ def escape_markdown(text):
 
 async def reply_private(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Envoyer la reponse en prive a l'utilisateur (jamais dans le canal)"""
+    if not update.effective_user:
+        return
+    # Ignorer les messages auto-forwarded depuis un channel (evite les doublons)
+    if update.message and update.message.is_automatic_forward:
+        return
     user_id = update.effective_user.id
     try:
         await context.bot.send_message(chat_id=user_id, text=text)
@@ -1015,7 +1020,10 @@ async def main():
     # Demarrer PTB SANS run_polling() — on gere la boucle nous-memes
     async with application:
         await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await application.updater.start_polling(
+            allowed_updates=["message"],
+            drop_pending_updates=True
+        )
 
         logger.info("Bot PTB demarre en mode polling manuel")
         logger.info("Pyrogram et PTB partagent la meme boucle asyncio")
