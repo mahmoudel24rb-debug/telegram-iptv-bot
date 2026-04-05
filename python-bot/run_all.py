@@ -1098,6 +1098,12 @@ async def main():
         logger.info("Bot PTB demarre en mode polling manuel")
         logger.info("Pyrogram et PTB partagent la meme boucle asyncio")
 
+        # Initialiser Pyrogram et les taches de fond (remplace post_init)
+        try:
+            await post_init(application)
+        except Exception as e:
+            logger.error(f"Erreur dans post_init: {e}")
+
         # Attendre indefiniment (SIGTERM/SIGINT pour arreter)
         stop_event = asyncio.Event()
 
