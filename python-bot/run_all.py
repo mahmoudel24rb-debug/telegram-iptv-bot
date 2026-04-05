@@ -7,6 +7,7 @@ import os
 import re
 import time
 import asyncio
+import signal
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from logger import setup_logger
@@ -29,6 +30,7 @@ from stream_state import save_state, load_state, clear_state
 from news_cache import NewsCache
 from news_queue import NewsQueue
 from reminders import load_reminders, add_reminder, delete_reminder, get_due_reminders, mark_sent, parse_interval, format_interval
+from claude_processor import process_message, process_message_batch, CONFIDENCE_THRESHOLD
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -48,6 +50,8 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 IPTV_SERVER = os.getenv("IPTV_SERVER_URL")
 IPTV_USER = os.getenv("IPTV_USERNAME")
 IPTV_PASS = os.getenv("IPTV_PASSWORD")
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # Configuration News Forwarder (configurable via .env)
 NEWS_SOURCE_CHANNEL = int(os.getenv("NEWS_SOURCE_CHANNEL", "-1001763758614"))
@@ -98,6 +102,10 @@ health = HealthCheck()
 news_cache = NewsCache()
 news_queue = NewsQueue()
 
+# Flag pour le test du listener on_message
+_listener_test_event = None
+_listener_test_start = None
+
 # Etat du streaming
 current_stream = None
 categories_cache = []
@@ -139,64 +147,97 @@ def modify_news_message(text: str) -> str:
     return text.strip()
 
 
+async def process_news_message(raw_text: str) -> tuple:
+    """
+    Traite un message news : decide s'il faut le transferer et le reecrit.
+
+    Utilise Claude API en priorite, fallback sur le filtrage regex si l'API
+    est indisponible ou en erreur.
+
+    Returns:
+        (should_forward, modified_text, category)
+    """
+    # ── Tentative Claude API ──
+    result = await process_message(raw_text)
+
+    if result is not None:
+        # Claude a repondu — utiliser sa decision
+        if result["should_forward"] and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD:
+            return True, result["rewritten_message"], result["category"]
+        else:
+            return False, None, result.get("category")
+
+    # ── Fallback regex (Claude indisponible) ──
+    logger.warning("[NEWS] Claude API indisponible — fallback regex")
+
+    if not should_forward_news(raw_text):
+        return False, None, None
+
+    modified = modify_news_message(raw_text)
+    return True, modified, "unknown"
+
+
 async def forward_news(client: Client, message: Message):
-    """Intercepter et transferer les messages filtres (texte + images)"""
-    logger.info(f"[NEWS] Message recu: chat_id={message.chat.id}, msg_id={message.id}, text={repr((message.text or message.caption or '')[:80])}")
+    """Handler temps reel — traite chaque message via Claude API."""
+    global _listener_test_event
+    logger.info(f"[NEWS-RT] on_message declenche! msg_id={message.id}, chat={message.chat.id}, text={repr((message.text or message.caption or '')[:80])}")
+
+    # Signal pour /testlistener
+    if _listener_test_event and not _listener_test_event.is_set():
+        _listener_test_event.set()
 
     text = message.text or message.caption or ""
-
-    if not text:
-        logger.debug(f"[NEWS] Message {message.id} sans texte, ignore")
+    if not text.strip():
         return
 
-    # Verifier le cache anti-doublons
+    # Anti-doublon
     if news_cache.is_forwarded(message.id):
-        logger.debug(f"[NEWS] Message {message.id} deja transfere (cache), ignore")
+        logger.debug(f"[NEWS-RT] Message {message.id} deja dans le cache — skip")
         return
 
-    if should_forward_news(text):
-        logger.info(f"[NEWS] Message {message.id} accepte pour transfert")
-        logger.debug(f"Apercu: {text[:100]}...")
+    # Traitement via Claude (avec fallback regex)
+    should_forward, modified_text, category = await process_news_message(text)
 
-        modified_text = modify_news_message(text)
+    logger.info(f"[NEWS-RT] Message {message.id} | forward={should_forward} | cat={category}")
 
-        # Preparer la fonction d'envoi selon le type de contenu
+    if should_forward and modified_text:
         if message.photo:
-            logger.info("Image detectee, telechargement...")
             photo_path = await message.download()
-
-            async def send_photo():
+            try:
+                with open(photo_path, 'rb') as photo_file:
+                    await telegram_bot.send_photo(
+                        chat_id=NEWS_DEST_CHANNEL,
+                        photo=photo_file,
+                        caption=modified_text
+                    )
+                logger.info(f"[NEWS-RT] Image + texte envoyes vers {NEWS_DEST_CHANNEL}")
+                health.last_news_forwarded = time.time()
+            except Exception as e:
+                logger.error(f"[NEWS-RT] Erreur envoi photo: {e}")
+                # Fallback texte
+                await telegram_bot.send_message(
+                    chat_id=NEWS_DEST_CHANNEL,
+                    text=modified_text
+                )
+                health.last_news_forwarded = time.time()
+            finally:
                 try:
-                    with open(photo_path, 'rb') as photo_file:
-                        await telegram_bot.send_photo(
-                            chat_id=NEWS_DEST_CHANNEL,
-                            photo=photo_file,
-                            caption=modified_text
-                        )
-                    logger.info(f"Image + texte envoyes vers {NEWS_DEST_CHANNEL}")
-                    health.last_news_forwarded = time.time()
-                    news_cache.mark_forwarded(message.id)
-                finally:
-                    # Supprimer le fichier temporaire
-                    try:
-                        os.remove(photo_path)
-                    except OSError:
-                        pass
-
-            await news_queue.enqueue(send_photo)
+                    os.remove(photo_path)
+                except OSError:
+                    pass
         else:
             async def send_text():
                 await telegram_bot.send_message(
                     chat_id=NEWS_DEST_CHANNEL,
                     text=modified_text
                 )
-                logger.info(f"Message envoye vers {NEWS_DEST_CHANNEL}")
+                logger.info(f"[NEWS-RT] Message envoye vers {NEWS_DEST_CHANNEL}")
                 health.last_news_forwarded = time.time()
-                news_cache.mark_forwarded(message.id)
 
             await news_queue.enqueue(send_text)
-    else:
-        logger.debug(f"[NEWS] Message {message.id} ne matche pas les patterns, ignore")
+
+    # Cacher dans tous les cas (transfere ou non)
+    news_cache.mark_forwarded(message.id)
 
 
 # Enregistrer le handler news seulement si le client utilisateur est disponible
@@ -504,6 +545,7 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     imported = 0
     skipped = 0
+    claude_calls = 0
 
     try:
         async for message in user_client.get_chat_history(NEWS_SOURCE_CHANNEL):
@@ -520,9 +562,11 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 skipped += 1
                 continue
 
-            if should_forward_news(text):
-                modified_text = modify_news_message(text)
+            # Traitement via Claude (avec fallback regex)
+            should_fwd, modified_text, category = await process_news_message(text)
+            claude_calls += 1
 
+            if should_fwd and modified_text:
                 if message.photo:
                     photo_path = await message.download()
                     try:
@@ -543,21 +587,24 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         text=modified_text
                     )
 
-                news_cache.mark_forwarded(message.id)
                 imported += 1
-                logger.info(f"Import news: message {message.id} transfere")
+                logger.info(f"Import news: message {message.id} transfere [{category}]")
 
-                # Pause anti-rate-limit
-                await asyncio.sleep(1.5)
+            news_cache.mark_forwarded(message.id)
 
+            # Pause anti-rate-limit
+            await asyncio.sleep(1.5 if should_fwd else 0.5)
+
+        logger.info(f"[NEWS-IMPORT] {claude_calls} appels Claude (~{claude_calls * 0.003:.2f}$ estime)")
         await reply_private(update, context,
             f"Import termine!\n"
             f"Messages importes: {imported}\n"
-            f"Deja importes (ignores): {skipped}"
+            f"Deja importes (ignores): {skipped}\n"
+            f"Appels Claude: {claude_calls}"
         )
     except Exception as e:
         logger.exception(f"Erreur dans importnews_command: {e}")
-        await reply_private(update, context,f"Erreur pendant l'import: {e}\nMessages importes avant erreur: {imported}")
+        await reply_private(update, context, f"Erreur pendant l'import: {e}\nMessages importes avant erreur: {imported}")
 
 
 async def announcement_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -651,6 +698,36 @@ async def delreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_private(update, context, f"Rappel {rid} introuvable.")
 
 
+async def testlistener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tester si le handler on_message Pyrogram fonctionne"""
+    global _listener_test_event, _listener_test_start
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not HAS_USER_CLIENT or not user_client:
+        await reply_private(update, context, "Client utilisateur non connecte")
+        return
+
+    await reply_private(update, context, "Test du listener on_message...\nEn attente d'un message dans le canal source (60s max).")
+    logger.info("[NEWS-RT] Test listener — en attente d'un message dans le canal source...")
+
+    _listener_test_event = asyncio.Event()
+    _listener_test_start = time.time()
+
+    try:
+        await asyncio.wait_for(_listener_test_event.wait(), timeout=60)
+        elapsed = time.time() - _listener_test_start
+        await reply_private(update, context, f"Listener actif — message capte en {elapsed:.1f}s")
+        logger.info(f"[NEWS-RT] Test listener OK — message capte en {elapsed:.1f}s")
+    except asyncio.TimeoutError:
+        await reply_private(update, context, "Listener inactif — on_message ne se declenche pas apres 60s")
+        logger.warning("[NEWS-RT] Test listener ECHEC — timeout 60s")
+    finally:
+        _listener_test_event = None
+        _listener_test_start = None
+
+
 async def reminder_worker(bot):
     """Tache de fond: envoyer les rappels echus"""
     while True:
@@ -672,50 +749,109 @@ NEWS_POLL_INTERVAL = int(os.getenv("NEWS_POLL_INTERVAL", "7200"))  # 2h par defa
 
 
 async def news_poll_worker():
-    """Tache de fond: importer les news automatiquement toutes les 2h"""
+    """Auto-import avec regroupement intelligent des messages."""
     while True:
         await asyncio.sleep(NEWS_POLL_INTERVAL)
         if not HAS_USER_CLIENT or not user_client:
             continue
         try:
-            since_date = datetime.now() - timedelta(hours=3)
-            imported = 0
+            logger.info("[NEWS-POLL] Debut du cycle d'import")
+            cutoff = datetime.now() - timedelta(hours=3)
+            pending_messages = []
+
+            # Phase 1 : Collecter tous les nouveaux messages
             async for message in user_client.get_chat_history(NEWS_SOURCE_CHANNEL):
-                if message.date.replace(tzinfo=None) < since_date:
+                if message.date.replace(tzinfo=None) < cutoff:
                     break
                 text = message.text or message.caption or ""
-                if not text:
+                if not text.strip():
                     continue
                 if news_cache.is_forwarded(message.id):
                     continue
-                if should_forward_news(text):
-                    modified_text = modify_news_message(text)
-                    if message.photo:
-                        photo_path = await message.download()
-                        try:
-                            with open(photo_path, 'rb') as photo_file:
-                                await telegram_bot.send_photo(
-                                    chat_id=NEWS_DEST_CHANNEL,
-                                    photo=photo_file,
-                                    caption=modified_text
-                                )
-                        finally:
-                            try:
-                                os.remove(photo_path)
-                            except OSError:
-                                pass
-                    else:
+                pending_messages.append({
+                    "id": message.id,
+                    "text": text,
+                    "has_photo": bool(message.photo),
+                    "message": message,
+                    "date": message.date,
+                })
+
+            if not pending_messages:
+                logger.info("[NEWS-POLL] Aucun nouveau message")
+                continue
+
+            # Phase 2 : Regrouper les messages proches (< 30 min d'ecart)
+            pending_messages.sort(key=lambda m: m["date"])
+            groups = []
+            current_group = [pending_messages[0]]
+
+            for msg in pending_messages[1:]:
+                time_diff = (msg["date"] - current_group[-1]["date"]).total_seconds()
+                if time_diff <= 1800:  # 30 minutes
+                    current_group.append(msg)
+                else:
+                    groups.append(current_group)
+                    current_group = [msg]
+            groups.append(current_group)
+
+            # Phase 3 : Traiter chaque groupe
+            imported = 0
+
+            for group in groups:
+                if len(group) >= 3:
+                    # Batch : 3+ messages proches → synthese unique
+                    texts = [m["text"] for m in group]
+                    result = await process_message_batch(texts)
+
+                    if result and result["should_forward"] and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD:
                         await telegram_bot.send_message(
                             chat_id=NEWS_DEST_CHANNEL,
-                            text=modified_text
+                            text=result["rewritten_message"]
                         )
-                    news_cache.mark_forwarded(message.id)
-                    imported += 1
+                        imported += 1
+                        health.last_news_forwarded = time.time()
+                        logger.info(f"[NEWS-POLL] Batch de {len(group)} messages envoye [{result['category']}]")
+
+                    for m in group:
+                        news_cache.mark_forwarded(m["id"])
                     await asyncio.sleep(1.5)
-            if imported > 0:
-                logger.info(f"[NEWS-POLL] {imported} message(s) importe(s)")
-            else:
-                logger.debug("[NEWS-POLL] Aucun nouveau message")
+
+                else:
+                    # Traitement individuel (1-2 messages)
+                    for m in group:
+                        should_fwd, modified_text, category = await process_news_message(m["text"])
+
+                        if should_fwd and modified_text:
+                            if m["has_photo"]:
+                                try:
+                                    photo_path = await m["message"].download()
+                                    with open(photo_path, 'rb') as photo_file:
+                                        await telegram_bot.send_photo(
+                                            chat_id=NEWS_DEST_CHANNEL,
+                                            photo=photo_file,
+                                            caption=modified_text
+                                        )
+                                    os.remove(photo_path)
+                                except Exception as e:
+                                    logger.error(f"[NEWS-POLL] Erreur photo: {e}")
+                                    await telegram_bot.send_message(
+                                        chat_id=NEWS_DEST_CHANNEL,
+                                        text=modified_text
+                                    )
+                            else:
+                                await telegram_bot.send_message(
+                                    chat_id=NEWS_DEST_CHANNEL,
+                                    text=modified_text
+                                )
+                            imported += 1
+                            health.last_news_forwarded = time.time()
+                            logger.info(f"[NEWS-POLL] Transfere msg {m['id']} [{category}]")
+
+                        news_cache.mark_forwarded(m["id"])
+                        await asyncio.sleep(1.5 if should_fwd else 0.5)
+
+            logger.info(f"[NEWS-POLL] Cycle termine: {imported} envoye(s) depuis {len(pending_messages)} message(s)")
+
         except Exception as e:
             logger.error(f"[NEWS-POLL] Erreur: {e}")
 
@@ -815,6 +951,7 @@ async def post_init(application):
 
         logger.info(f"Ecoute canal source: {NEWS_SOURCE_CHANNEL}")
         logger.info(f"Destination news: {NEWS_DEST_CHANNEL}")
+        logger.info(f"Pyrogram dispatcher actif: {user_client.is_connected}")
         logger.info(f"Handlers Pyrogram enregistres: {len(user_client.dispatcher.groups)}")
 
         # Demarrer la file d'attente news
@@ -829,6 +966,11 @@ async def post_init(application):
         # Lancer le polling auto des news toutes les 2h
         asyncio.create_task(news_poll_worker())
         logger.info(f"[NEWS-POLL] Auto-import actif (toutes les {NEWS_POLL_INTERVAL}s)")
+
+        if ANTHROPIC_API_KEY:
+            logger.info("[CLAUDE] API Claude configuree — traitement intelligent des news actif")
+        else:
+            logger.warning("[CLAUDE] ANTHROPIC_API_KEY absente — fallback regex uniquement")
     else:
         logger.warning("Mode commandes uniquement (pas de streaming/news)")
 
@@ -842,8 +984,8 @@ async def post_init(application):
     await health.start(port=health_port)
 
 
-def main():
-    """Fonction principale"""
+async def main():
+    """Boucle principale — gere PTB et Pyrogram dans le meme event loop."""
     logger.info("=" * 50)
     logger.info("BingeBear TV - Combined Bot")
     logger.info("=" * 50)
@@ -866,11 +1008,43 @@ def main():
     application.add_handler(CommandHandler("reminder", reminder_command))
     application.add_handler(CommandHandler("reminders", reminders_list_command))
     application.add_handler(CommandHandler("delreminder", delreminder_command))
+    application.add_handler(CommandHandler("testlistener", testlistener_command))
 
     logger.info("Bot pret!")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Demarrer PTB SANS run_polling() — on gere la boucle nous-memes
+    async with application:
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        logger.info("Bot PTB demarre en mode polling manuel")
+        logger.info("Pyrogram et PTB partagent la meme boucle asyncio")
+
+        # Attendre indefiniment (SIGTERM/SIGINT pour arreter)
+        stop_event = asyncio.Event()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                # Windows ne supporte pas add_signal_handler
+                pass
+
+        try:
+            await stop_event.wait()
+        except KeyboardInterrupt:
+            pass
+
+        logger.info("Arret en cours...")
+        await application.updater.stop()
+        await application.stop()
+
+        # Arreter Pyrogram proprement
+        if HAS_USER_CLIENT and user_client:
+            await user_client.stop()
+            logger.info("Client Pyrogram arrete")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

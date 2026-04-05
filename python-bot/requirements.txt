@@ -5,3 +5,4 @@ python-dotenv
 requests
 tgcrypto
 aiohttp
+anthropic>=0.40.0

@@ -23,6 +23,7 @@ RECOMMENDED_VARS = [
     'IPTV_SERVER_URL',
     'IPTV_USERNAME',
     'IPTV_PASSWORD',
+    'ANTHROPIC_API_KEY',
 ]
 
 # Variables optionnelles avec valeurs par défaut
