@@ -109,7 +109,7 @@ Le bot utilise DEUX connexions Telegram separees :
 - Demarre dans `post_init()` avec `await user_client.start()`
 
 **2. `telegram_bot` (python-telegram-bot)**
-- C'est un BOT Telegram (@Bingebear_tv_bot)
+- C'est un BOT Telegram ([bot configure via BOT_TOKEN])
 - Authentifie via `BOT_TOKEN`
 - Sert a : recevoir les commandes (/play, /importnews...), envoyer les messages dans le canal destination, repondre en DM prive
 - DOIT etre admin du canal destination pour pouvoir y poster
@@ -120,7 +120,7 @@ Executee automatiquement apres le demarrage du bot. C'est la qu'on demarre tout 
 
 ```
 1. Demarre user_client (Pyrogram) → await user_client.start()
-2. Recupere l'identite → "Connecte: DeFi Mack (@DefiMack)"
+2. Recupere l'identite → "Connecte: [compte utilisateur configure]"
 3. Demarre PyTgCalls → streaming disponible
 4. Verifie l'acces au canal source → log si accessible ou non
 5. Verifie le statut membre → "ChatMemberStatus.MEMBER"
@@ -735,7 +735,7 @@ Le bot verifie et log au demarrage :
 Configuration validee — toutes les variables requises sont presentes
 BingeBear TV - Combined Bot
 Demarrage du client utilisateur...
-Connecte: DeFi Mack (@DefiMack)                              ← SESSION_STRING valide
+Connecte: [compte utilisateur configure]                              ← SESSION_STRING valide
 PyTgCalls pret                                                 ← streaming disponible
 Canal source accessible: SERVICE INFORMATION (id=-1001763758614) ← canal lisible
 Statut dans le canal source: ChatMemberStatus.MEMBER           ← compte abonne
@@ -862,7 +862,7 @@ Les anciennes fonctions `should_forward_news()` et `modify_news_message()` sont 
 
 1. **SESSION_STRING** : Indispensable pour le streaming ET le transfert de news. Sans elle, le bot ne peut que repondre aux commandes basiques. Generee via `generate_session.py`.
 
-2. **Deux clients Telegram** : Le bot utilise un client utilisateur (Pyrogram, compte DeFi Mack) ET un bot (@Bingebear_tv_bot). Les deux sont necessaires : le user_client ecoute/lit, le bot envoie.
+2. **Deux clients Telegram** : Le bot utilise un client utilisateur (Pyrogram, compte utilisateur Pyrogram) ET un bot ([bot configure via BOT_TOKEN]). Les deux sont necessaires : le user_client ecoute/lit, le bot envoie.
 
 3. **Rate limiting** : Telegram limite a ~30 msg/sec par canal. Le bot espace les envois de 1.5s. L'erreur 429 est geree automatiquement.
 

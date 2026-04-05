@@ -50,11 +50,13 @@ fi
 # 3. Installer les dependances systeme
 # =============================================================
 log_info "Installation des dependances systeme..."
-apt install -y \
-    software-properties-common \
-    python3.11 python3.11-venv python3.11-dev \
-    ffmpeg libavcodec-extra \
-    git curl htop ufw
+apt install -y software-properties-common git curl htop ufw ffmpeg libavcodec-extra
+
+# Ajouter le PPA deadsnakes pour Python 3.11
+log_info "Ajout du PPA deadsnakes pour Python 3.11..."
+add-apt-repository -y ppa:deadsnakes/ppa
+apt update
+apt install -y python3.11 python3.11-venv python3.11-dev
 
 # Verifier les installations
 log_info "Python: $(python3.11 --version 2>&1)"
