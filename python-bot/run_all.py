@@ -14,8 +14,8 @@ from logger import setup_logger
 from config import validate_config
 from utils.retry import retry_sync
 
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram import Update
 
 from pyrogram import Client, filters
@@ -31,6 +31,13 @@ from news_cache import NewsCache
 from news_queue import NewsQueue
 from reminders import load_reminders, add_reminder, delete_reminder, get_due_reminders, mark_sent, parse_interval, format_interval
 from claude_processor import process_message, process_message_batch, CONFIDENCE_THRESHOLD
+from promotions import (
+    load_promos, add_promo, delete_promo, toggle_promo,
+    update_promo_message, get_promo, get_due_promos, mark_promo_sent,
+    format_schedule, format_promo_summary, parse_weekdays,
+    parse_interval as parse_promo_interval,
+    TEMPLATES, WEEKDAY_NAMES,
+)
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -574,7 +581,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reminder <intervalle> <msg> - Rappel recurrent (admin)\n"
         "/reminders - Liste des rappels (admin)\n"
         "/delreminder <id> - Supprimer rappel (admin)\n"
-        "/importnews <jours> - Importer les news (admin)"
+        "/importnews <jours> - Importer les news (admin)\n"
+        "/promos - Panel campagnes promo (admin)\n"
+        "/addpromo - Creer une campagne (admin)\n"
+        "/editpromo <id> <msg> - Modifier le message (admin)\n"
+        "/delpromo <id> - Supprimer une campagne (admin)"
     )
 
 
@@ -798,6 +809,448 @@ async def testlistener_command(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         _listener_test_event = None
         _listener_test_start = None
+
+
+async def promos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/promos — Panel principal des campagnes promotionnelles."""
+    if _is_duplicate_update(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    promos = load_promos()
+
+    if not promos:
+        keyboard = [
+            [InlineKeyboardButton("➕ Creer depuis un template", callback_data="promo_templates")],
+            [InlineKeyboardButton("✍️ Creer une promo custom", callback_data="promo_help_add")],
+        ]
+        await reply_private(update, context, "Aucune campagne promo active.\n\nCreez votre premiere promo:")
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Choisissez une option:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    lines = ["📢 Campagnes promotionnelles\n"]
+    keyboard_rows = []
+
+    for pid, data in promos.items():
+        lines.append(format_promo_summary(pid, data))
+        lines.append("")
+
+        status_icon = "⏸" if data.get("active") else "▶️"
+        keyboard_rows.append([
+            InlineKeyboardButton(f"{status_icon} {data.get('name', pid)[:15]}", callback_data=f"promo_toggle_{pid}"),
+            InlineKeyboardButton("👁 Preview", callback_data=f"promo_preview_{pid}"),
+            InlineKeyboardButton("🗑", callback_data=f"promo_delete_{pid}"),
+        ])
+
+    keyboard_rows.append([
+        InlineKeyboardButton("➕ Template", callback_data="promo_templates"),
+        InlineKeyboardButton("✍️ Custom", callback_data="promo_help_add"),
+    ])
+
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+    )
+
+
+async def addpromo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addpromo — Creer une campagne promotionnelle."""
+    if _is_duplicate_update(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not context.args or len(context.args) < 2:
+        help_text = (
+            "📢 Creer une campagne promo\n\n"
+            "Depuis un template:\n"
+            "  /addpromo template free_trial\n"
+            "  /addpromo template renewal\n"
+            "  /addpromo template weekend_deal\n"
+            "  /addpromo template sport_promo\n"
+            "  /addpromo template new_user\n\n"
+            "Promo a intervalle:\n"
+            "  /addpromo interval <freq> <heure> <message>\n"
+            "  /addpromo interval 48h 11 Mon message ici\n"
+            "  /addpromo interval 3d 18 Texte de la promo\n\n"
+            "Promo sur jours specifiques:\n"
+            "  /addpromo days <jours> <heure> <message>\n"
+            "  /addpromo days weekends 12 Promo du weekend!\n"
+            "  /addpromo days fri,sat 17 Match ce soir!\n"
+            "  /addpromo days mon,wed,fri 10 Offre speciale\n\n"
+            "Jours: mon,tue,wed,thu,fri,sat,sun\n"
+            "Raccourcis: weekends, weekdays, daily\n"
+            "Heure: 0-23 (heure locale UK/Ireland)"
+        )
+        await reply_private(update, context, help_text)
+        return
+
+    subcommand = context.args[0].lower()
+    user_id = update.effective_user.id
+
+    if subcommand == "template":
+        template_key = context.args[1].lower()
+        if template_key not in TEMPLATES:
+            available = ", ".join(TEMPLATES.keys())
+            await reply_private(update, context, f"Template inconnu: {template_key}\nDisponibles: {available}")
+            return
+
+        tpl = TEMPLATES[template_key]
+        pid = add_promo(
+            name=tpl["name"],
+            message=tpl["message"],
+            schedule_type=tpl["schedule_type"],
+            interval_seconds=tpl.get("interval_seconds", 0),
+            weekdays=tpl.get("weekdays", []),
+            send_hour=tpl.get("send_hour", 10),
+            created_by=user_id,
+        )
+
+        schedule_str = format_schedule(tpl)
+        await reply_private(update, context,
+            f"✅ Promo cree depuis template!\n\n"
+            f"ID: {pid}\n"
+            f"Nom: {tpl['name']}\n"
+            f"Schedule: {schedule_str}\n\n"
+            f"Message:\n{tpl['message'][:200]}\n\n"
+            f"Utilisez /promos pour gerer vos campagnes."
+        )
+        logger.info(f"[PROMO] Campagne {pid} cree depuis template '{template_key}' par {user_id}")
+        return
+
+    if subcommand == "interval":
+        if len(context.args) < 4:
+            await reply_private(update, context, "Usage: /addpromo interval <freq> <heure> <message>\nExemple: /addpromo interval 48h 11 Mon message")
+            return
+
+        interval_str = context.args[1]
+        interval_secs = parse_promo_interval(interval_str)
+        if interval_secs is None:
+            await reply_private(update, context, "Intervalle invalide. Utilisez: 30m, 12h, 48h, 2d, 1w...")
+            return
+
+        try:
+            send_hour = int(context.args[2])
+            if not (0 <= send_hour <= 23):
+                raise ValueError
+        except ValueError:
+            await reply_private(update, context, "Heure invalide. Utilisez un nombre entre 0 et 23.")
+            return
+
+        message = " ".join(context.args[3:])
+        auto_name = message[:30].strip()
+        if len(message) > 30:
+            auto_name += "..."
+
+        pid = add_promo(
+            name=auto_name,
+            message=message,
+            schedule_type="interval",
+            interval_seconds=interval_secs,
+            send_hour=send_hour,
+            created_by=user_id,
+        )
+
+        await reply_private(update, context,
+            f"✅ Promo cree!\n\n"
+            f"ID: {pid}\n"
+            f"Frequence: Every {interval_str}\n"
+            f"Heure d'envoi: ~{send_hour}:00\n"
+            f"Message: {message[:100]}"
+        )
+        logger.info(f"[PROMO] Campagne interval {pid} cree par {user_id}: every {interval_str} at {send_hour}h")
+        return
+
+    if subcommand == "days":
+        if len(context.args) < 4:
+            await reply_private(update, context, "Usage: /addpromo days <jours> <heure> <message>\nExemple: /addpromo days weekends 12 Ma promo")
+            return
+
+        days_str = context.args[1]
+        weekdays = parse_weekdays(days_str)
+        if weekdays is None:
+            await reply_private(update, context,
+                "Jours invalides.\n"
+                "Utilisez: mon,tue,wed,thu,fri,sat,sun\n"
+                "Raccourcis: weekends, weekdays, daily"
+            )
+            return
+
+        try:
+            send_hour = int(context.args[2])
+            if not (0 <= send_hour <= 23):
+                raise ValueError
+        except ValueError:
+            await reply_private(update, context, "Heure invalide. Utilisez un nombre entre 0 et 23.")
+            return
+
+        message = " ".join(context.args[3:])
+        day_names = [WEEKDAY_NAMES.get(d, "?") for d in weekdays]
+        auto_name = f"{','.join(day_names)} promo"
+
+        pid = add_promo(
+            name=auto_name,
+            message=message,
+            schedule_type="weekdays",
+            weekdays=weekdays,
+            send_hour=send_hour,
+            created_by=user_id,
+        )
+
+        await reply_private(update, context,
+            f"✅ Promo cree!\n\n"
+            f"ID: {pid}\n"
+            f"Jours: {', '.join(day_names)}\n"
+            f"Heure d'envoi: ~{send_hour}:00\n"
+            f"Message: {message[:100]}"
+        )
+        logger.info(f"[PROMO] Campagne weekdays {pid} cree par {user_id}: {','.join(day_names)} at {send_hour}h")
+        return
+
+    await reply_private(update, context, "Sous-commande inconnue. Utilisez: template, interval, ou days\nTapez /addpromo pour l'aide.")
+
+
+async def editpromo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/editpromo <id> <nouveau_message>"""
+    if _is_duplicate_update(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await reply_private(update, context,
+            "Usage: /editpromo <id> <nouveau_message>\n"
+            "Exemple: /editpromo a3f2b1c9 Nouveau texte de la promo!"
+        )
+        return
+
+    pid = context.args[0]
+    new_message = " ".join(context.args[1:])
+
+    if update_promo_message(pid, new_message):
+        await reply_private(update, context, f"✅ Promo {pid} modifiee.\nNouveau message: {new_message[:100]}")
+        logger.info(f"[PROMO] Campagne {pid} modifiee par {update.effective_user.id}")
+    else:
+        await reply_private(update, context, f"Promo {pid} introuvable.")
+
+
+async def delpromo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delpromo <id>"""
+    if _is_duplicate_update(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not context.args:
+        await reply_private(update, context, "Usage: /delpromo <id>")
+        return
+
+    pid = context.args[0]
+    promo = get_promo(pid)
+    if promo:
+        delete_promo(pid)
+        await reply_private(update, context, f"✅ Promo supprimee: {promo.get('name', pid)}")
+        logger.info(f"[PROMO] Campagne {pid} supprimee par {update.effective_user.id}")
+    else:
+        await reply_private(update, context, f"Promo {pid} introuvable.")
+
+
+async def promo_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gere tous les callbacks des boutons inline du systeme promo."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user_id = query.from_user.id
+
+    if not is_admin(user_id):
+        await query.edit_message_text("Non autorise.")
+        return
+
+    if data.startswith("promo_toggle_"):
+        pid = data.replace("promo_toggle_", "")
+        new_state = toggle_promo(pid)
+        if new_state:
+            emoji = "✅ Active" if new_state == "active" else "⏸️ En pause"
+            promo = get_promo(pid)
+            name = promo.get("name", pid) if promo else pid
+            await query.edit_message_text(
+                f"{emoji}: {name}\n\nUtilisez /promos pour voir le panel."
+            )
+            logger.info(f"[PROMO] Campagne {pid} -> {new_state} par {user_id}")
+        else:
+            await query.edit_message_text(f"Promo {pid} introuvable.")
+
+    elif data.startswith("promo_preview_"):
+        pid = data.replace("promo_preview_", "")
+        promo = get_promo(pid)
+        if promo:
+            schedule_str = format_schedule(promo)
+            preview = (
+                f"👁 Preview — {promo.get('name', 'Sans nom')}\n"
+                f"Schedule: {schedule_str}\n"
+                f"Envois: {promo.get('times_sent', 0)}x\n"
+                f"{'─' * 30}\n\n"
+                f"{promo['message']}"
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("⏸ Pause" if promo.get("active") else "▶️ Resume", callback_data=f"promo_toggle_{pid}"),
+                    InlineKeyboardButton("🗑 Supprimer", callback_data=f"promo_confirm_delete_{pid}"),
+                ],
+                [InlineKeyboardButton("◀️ Retour", callback_data="promo_back")],
+            ]
+            await query.edit_message_text(preview, reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await query.edit_message_text(f"Promo {pid} introuvable.")
+
+    elif data.startswith("promo_confirm_delete_"):
+        pid = data.replace("promo_confirm_delete_", "")
+        promo = get_promo(pid)
+        if promo:
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Oui, supprimer", callback_data=f"promo_delete_{pid}"),
+                    InlineKeyboardButton("❌ Annuler", callback_data="promo_back"),
+                ],
+            ]
+            await query.edit_message_text(
+                f"Supprimer la promo \"{promo.get('name', pid)}\" ?\nCette action est irreversible.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+    elif data.startswith("promo_delete_"):
+        pid = data.replace("promo_delete_", "")
+        promo = get_promo(pid)
+        name = promo.get("name", pid) if promo else pid
+        if delete_promo(pid):
+            await query.edit_message_text(f"🗑 Promo supprimee: {name}\n\nUtilisez /promos pour voir le panel.")
+            logger.info(f"[PROMO] Campagne {pid} supprimee par {user_id} (via bouton)")
+        else:
+            await query.edit_message_text(f"Promo {pid} introuvable.")
+
+    elif data == "promo_templates":
+        lines = ["📋 Templates disponibles\n"]
+        keyboard_rows = []
+
+        for key, tpl in TEMPLATES.items():
+            schedule_str = format_schedule(tpl)
+            lines.append(f"🔹 {tpl['name']} ({schedule_str})")
+            lines.append(f"   {tpl['message'][:50]}...")
+            lines.append("")
+            keyboard_rows.append([
+                InlineKeyboardButton(f"✅ {tpl['name']}", callback_data=f"promo_use_tpl_{key}"),
+            ])
+
+        keyboard_rows.append([InlineKeyboardButton("◀️ Retour", callback_data="promo_back")])
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+    elif data.startswith("promo_use_tpl_"):
+        template_key = data.replace("promo_use_tpl_", "")
+        if template_key not in TEMPLATES:
+            await query.edit_message_text("Template introuvable.")
+            return
+
+        tpl = TEMPLATES[template_key]
+        pid = add_promo(
+            name=tpl["name"],
+            message=tpl["message"],
+            schedule_type=tpl["schedule_type"],
+            interval_seconds=tpl.get("interval_seconds", 0),
+            weekdays=tpl.get("weekdays", []),
+            send_hour=tpl.get("send_hour", 10),
+            created_by=user_id,
+        )
+
+        schedule_str = format_schedule(tpl)
+        await query.edit_message_text(
+            f"✅ Promo cree!\n\n"
+            f"ID: {pid}\n"
+            f"Nom: {tpl['name']}\n"
+            f"Schedule: {schedule_str}\n\n"
+            f"Utilisez /promos pour gerer vos campagnes.\n"
+            f"Utilisez /editpromo {pid} <texte> pour modifier le message."
+        )
+        logger.info(f"[PROMO] Campagne {pid} cree depuis template '{template_key}' par {user_id} (via bouton)")
+
+    elif data == "promo_help_add":
+        help_text = (
+            "✍️ Creer une promo custom\n\n"
+            "Promo a intervalle:\n"
+            "  /addpromo interval 48h 11 Votre message\n\n"
+            "Promo sur jours specifiques:\n"
+            "  /addpromo days weekends 12 Promo weekend!\n"
+            "  /addpromo days fri,sat 18 Match ce soir!\n\n"
+            "Raccourcis jours: weekends, weekdays, daily"
+        )
+        keyboard = [[InlineKeyboardButton("◀️ Retour", callback_data="promo_back")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "promo_back":
+        promos = load_promos()
+        if not promos:
+            await query.edit_message_text("Aucune campagne promo. Utilisez /promos pour commencer.")
+            return
+
+        lines = ["📢 Campagnes promotionnelles\n"]
+        keyboard_rows = []
+
+        for pid, pdata in promos.items():
+            lines.append(format_promo_summary(pid, pdata))
+            lines.append("")
+
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    f"{'⏸' if pdata.get('active') else '▶️'} {pdata.get('name', pid)[:15]}",
+                    callback_data=f"promo_toggle_{pid}"
+                ),
+                InlineKeyboardButton("👁", callback_data=f"promo_preview_{pid}"),
+                InlineKeyboardButton("🗑", callback_data=f"promo_delete_{pid}"),
+            ])
+
+        keyboard_rows.append([
+            InlineKeyboardButton("➕ Template", callback_data="promo_templates"),
+            InlineKeyboardButton("✍️ Custom", callback_data="promo_help_add"),
+        ])
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+
+async def promo_worker(bot):
+    """Tache de fond: envoyer les promos planifiees toutes les 60s."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            due = get_due_promos()
+            for pid, data in due:
+                try:
+                    await bot.send_message(
+                        chat_id=NEWS_DEST_CHANNEL,
+                        text=data["message"],
+                    )
+                    mark_promo_sent(pid)
+                    logger.info(f"[PROMO] Campagne {pid} '{data.get('name', '?')}' envoyee (total: {data.get('times_sent', 0) + 1}x)")
+                except Exception as e:
+                    logger.error(f"[PROMO] Erreur envoi campagne {pid}: {e}")
+        except Exception as e:
+            logger.error(f"[PROMO] Erreur worker: {e}")
 
 
 async def reminder_worker(bot):
@@ -1052,6 +1505,10 @@ async def post_init(application):
     # Lancer le worker de rappels (independant du user_client)
     asyncio.create_task(reminder_worker(application.bot))
 
+    # Lancer le worker de campagnes promotionnelles
+    asyncio.create_task(promo_worker(application.bot))
+    logger.info("[PROMO] Worker de campagnes promotionnelles actif")
+
     logger.info(f"Groupe cible: @{CHAT_ID}")
 
     # Démarrer le health check HTTP
@@ -1084,6 +1541,11 @@ async def main():
     application.add_handler(CommandHandler("reminders", reminders_list_command))
     application.add_handler(CommandHandler("delreminder", delreminder_command))
     application.add_handler(CommandHandler("testlistener", testlistener_command))
+    application.add_handler(CommandHandler("promos", promos_command))
+    application.add_handler(CommandHandler("addpromo", addpromo_command))
+    application.add_handler(CommandHandler("editpromo", editpromo_command))
+    application.add_handler(CommandHandler("delpromo", delpromo_command))
+    application.add_handler(CallbackQueryHandler(promo_callback_handler, pattern="^promo_"))
 
     logger.info("Bot pret!")
 
