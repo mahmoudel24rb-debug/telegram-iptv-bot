@@ -826,10 +826,15 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 | Commit | Description |
 |--------|-------------|
+| `9c24ac8` | Fix post_init non execute en mode polling manuel — appel explicite apres start_polling |
+| `7009242` | Deplacement des fichiers morts vers archive/ + suppression infos personnelles dans la doc |
+| `6d6b094` | Optimisation Claude API : skip si message matche un pattern regex connu |
+| `43d0a90` | Fix 8 problemes audit : guard anti-doublon dans les handlers, pytgcalls null check, requests.get async, news_cache timing, budget Claude, etc. |
+| `b1624d3` | Fix nixpacks.toml : lance run_all.py au lieu de bot.py |
+| `2e965d9` | Mise a jour doc Railway + fix double reply (is_automatic_forward) |
 | `3ac10b6` | Refonte news: integration Claude API + fix asyncio on_message + /testlistener |
 | `892d826` | Ajout auto-import des news toutes les 2h (news_poll_worker) comme fallback du on_message |
 | `544f690` | Ajout commandes /announcement et /reminder pour gestion admin du canal |
-| `434c9b2` | Mise a jour documentation avec logs de diagnostic |
 | `1cbc42e` | Fix recursion infinie dans reply_private + ajout logs diagnostic news |
 | `e7955f1` | Toutes les reponses aux commandes envoyees en DM prive |
 | `3a4dccf` | Remplacement "Dear Reseller(s)" par "Dear Users" dans les news |
@@ -839,22 +844,42 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 ---
 
-## 16. Nouveautes : Integration Claude API (claude_processor.py)
+## 16. Integration Claude API (claude_processor.py)
 
 ### Description
 
-Nouveau module optionnel qui remplace le filtrage regex par l'API Claude (Anthropic) pour analyser et reecrire les messages de news. Necessite la variable `ANTHROPIC_API_KEY`.
+Module qui utilise l'API Claude (Anthropic) pour analyser et reecrire intelligemment les messages de news ambigus. Necessite la variable `ANTHROPIC_API_KEY`.
 
-### Fonctionnement
+### Strategie d'optimisation (regex first)
 
-1. Chaque message du canal source est envoye a Claude API avec un prompt systeme specifique
-2. Claude analyse le message et decide : FORWARD (transferer), SKIP (ignorer), ou URGENT (prioritaire)
-3. Si FORWARD ou URGENT : Claude reecrit le message avec le branding BingeBear TV
-4. Si l'API est indisponible ou la cle absente : fallback automatique sur l'ancien systeme regex
+Pour economiser les credits API, le bot utilise une approche en cascade :
 
-### Fallback
+1. **Etape 1 — Exclusion rapide** : si le message contient un mot interdit (`domain has been suspended`, `Queridos Revendedores`, etc.) → skip immediat, **0 appel API**
 
-Les anciennes fonctions `should_forward_news()` et `modify_news_message()` sont conservees. Si `ANTHROPIC_API_KEY` n'est pas configuree, le bot utilise automatiquement le systeme regex comme avant.
+2. **Etape 2 — Match regex connu** : si le message matche un pattern connu (`Dear Reseller`, `LIVE EVENT`, `EQUIPE1 VS EQUIPE2`) → traitement direct via les fonctions regex (`modify_news_message`), **0 appel API**
+
+3. **Etape 3 — Message ambigu** : seuls les messages que le regex ne reconnait pas sont envoyes a Claude API. Claude analyse, decide, et reecrit avec branding BingeBear TV
+
+4. **Fallback** : si Claude API est indisponible (cle manquante, erreur reseau, etc.), seuls les messages des etapes 1 et 2 sont traites
+
+### Categories detectees par Claude
+
+- `service_outage` : panne, maintenance, serveur down
+- `service_restored` : retour en ligne, probleme resolu
+- `new_content` : nouvelles chaines, bouquets, contenus
+- `live_event` : match sportif, evenement live
+- `app_update` : mise a jour d'app
+- `general_info` : autre info pertinente
+
+### Limites et budget
+
+- `CLAUDE_MAX_CALLS_PER_CYCLE` : limite d'appels par cycle de polling (defaut 50)
+- Compteur global `_claude_calls_total` log a chaque cycle
+- Cout estime affiche dans `/importnews` : ~$0.003 par appel (Claude Sonnet 4)
+
+### Fallback regex
+
+Les anciennes fonctions `should_forward_news()` et `modify_news_message()` sont conservees comme premiere ligne de defense. Si `ANTHROPIC_API_KEY` n'est pas configuree, le bot fonctionne en mode regex pur comme avant.
 
 ---
 
@@ -872,6 +897,8 @@ Les anciennes fonctions `should_forward_news()` et `modify_news_message()` sont 
 
 6. **Deploiement Railway** : Le bot tourne sur Railway.app via Docker. Les variables d'environnement sont gerees dans le dashboard Railway, pas dans un fichier .env.
 
-7. **Bug reponses en double** : Quand une commande est envoyee dans le channel (pas en DM prive au bot), le bot repond 2 fois. Cause probable : canal lie a un groupe de discussion, Telegram forward automatiquement le message. Fix en cours (check `is_automatic_forward`).
+7. **Bug reponses en double (RESOLU)** : Le check `_is_duplicate_update()` en haut de chaque handler ignore les messages auto-forwarded depuis un channel lie. Plus de doublons.
 
-8. **Bug on_message** : Le transfert automatique en temps reel n'est pas confirme fonctionnel. Le workaround (polling toutes les 2h via news_poll_worker) est en place et fiable. Delai max entre un message source et sa publication : 2 heures.
+8. **Bug on_message** : Le transfert automatique en temps reel via le handler Pyrogram peut ne pas se declencher. Le workaround `news_poll_worker` (polling toutes les 2h avec `get_chat_history()`) garantit que les messages sont transferes au plus tard 2h apres leur publication. Pour tester si l'on_message fonctionne en temps reel : `/testlistener` (admin uniquement).
+
+9. **Optimisation Claude API** : Les messages qui matchent les patterns regex connus sont traites directement sans appel API. Claude n'est appele que pour les messages ambigus (pannes, urgences, etc.). Cout estime : ~$0.003 par appel.
