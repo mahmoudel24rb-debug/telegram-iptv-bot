@@ -1,20 +1,21 @@
 FROM python:3.11-slim
 
-# Installer FFmpeg et dépendances système
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libavcodec-extra \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Définir le répertoire de travail
 WORKDIR /app
 
-# Copier les requirements et installer les dépendances Python
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY python-bot/requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copier le code
-COPY . .
+COPY python-bot/ .
 
-# Lancer le bot
-CMD ["python", "bot.py"]
+RUN mkdir -p /var/log/bingebear
+
+EXPOSE 8080
+
+CMD ["python", "run_all.py"]

@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from logger import setup_logger
 from config import validate_config
-from utils.retry import retry_sync
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
@@ -24,7 +23,7 @@ from pyrogram.types import Message
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
 
-import requests
+import aiohttp
 from health import HealthCheck
 from stream_state import save_state, load_state, clear_state
 from news_cache import NewsCache
@@ -283,19 +282,14 @@ def is_allowed_user(user):
     return False
 
 
-def _fetch_categories_sync():
-    url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_categories"
-    response = retry_sync(
-        lambda: requests.get(url, headers=HEADERS, timeout=30),
-        description='chargement categories IPTV'
-    )
-    return response.json()
-
-
 async def get_categories():
     global categories_cache
+    url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_categories"
     try:
-        categories = await asyncio.to_thread(_fetch_categories_sync)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=HEADERS) as resp:
+                categories = await resp.json(content_type=None)
         categories_cache = [{"id": cat["category_id"], "name": cat["category_name"]} for cat in categories]
         return categories_cache
     except Exception as e:
@@ -303,19 +297,14 @@ async def get_categories():
         return []
 
 
-def _fetch_channels_sync(category_id):
-    url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_streams&category_id={category_id}"
-    response = retry_sync(
-        lambda: requests.get(url, headers=HEADERS, timeout=30),
-        description=f'chargement chaines categorie {category_id}'
-    )
-    return response.json()
-
-
 async def get_channels_by_category(category_id):
     global channels_cache
+    url = f"{IPTV_SERVER}/player_api.php?username={IPTV_USER}&password={IPTV_PASS}&action=get_live_streams&category_id={category_id}"
     try:
-        channels = await asyncio.to_thread(_fetch_channels_sync, category_id)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=HEADERS) as resp:
+                channels = await resp.json(content_type=None)
         channels_list = [
             {"id": ch["stream_id"], "name": ch["name"], "category_id": category_id,
              "url": f"{IPTV_SERVER}/live/{IPTV_USER}/{IPTV_PASS}/{ch['stream_id']}.ts"}
@@ -334,6 +323,17 @@ def get_channel_by_id(channel_id):
             if str(ch["id"]) == str(channel_id):
                 return ch
     return None
+
+
+def sanitize_url(url: str) -> str:
+    """Masquer les credentials IPTV dans une URL pour les logs."""
+    if not url:
+        return url
+    if IPTV_USER:
+        url = url.replace(IPTV_USER, "***")
+    if IPTV_PASS:
+        url = url.replace(IPTV_PASS, "***")
+    return url
 
 
 def escape_markdown(text):

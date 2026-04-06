@@ -8,6 +8,8 @@ output/
 # Fichiers d'état et cache (generés au runtime)
 stream_state.json
 news_cache.json
+reminders.json
+promotions.json
 
 # Python
 __pycache__/
