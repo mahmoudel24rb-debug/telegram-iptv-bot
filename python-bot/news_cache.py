@@ -130,8 +130,12 @@ class NewsCache:
     # ========== Index 1 : par message source (channel_id, msg_id) ==========
 
     def is_source_seen(self, channel_id: int, message_id: int) -> bool:
-        """Vrai si ce message d'origine a deja ete vu."""
-        return f"{channel_id}:{message_id}" in self._by_source
+        """Vrai si ce message d'origine a deja ete vu (verifie aussi le format legacy)."""
+        if f"{channel_id}:{message_id}" in self._by_source:
+            return True
+        if f"legacy:{message_id}" in self._by_source:
+            return True
+        return False
 
     def mark_source_seen(self, channel_id: int, message_id: int):
         """Marque un message source comme vu et persiste."""
