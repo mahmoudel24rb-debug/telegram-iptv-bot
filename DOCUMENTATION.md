@@ -9,14 +9,16 @@
 5. [Systeme de transfert de news (DETAIL)](#5-systeme-de-transfert-de-news-detail)
 6. [Systeme de streaming IPTV](#6-systeme-de-streaming-iptv)
 7. [Commandes du bot](#7-commandes-du-bot)
-8. [Systeme de rappels (reminders)](#8-systeme-de-rappels-reminders)
+8. [Rappels et promotions](#8-systeme-de-rappels-reminders)
 9. [Modules auxiliaires](#9-modules-auxiliaires)
 10. [Authentification et autorisation](#10-authentification-et-autorisation)
 11. [Variables d'environnement](#11-variables-denvironnement)
 12. [Deploiement Railway](#12-deploiement-railway)
 13. [Diagnostic et debugging](#13-diagnostic-et-debugging)
-14. [Bugs connus](#14-bugs-connus)
+14. [Bugs connus et resolus](#14-bugs-connus)
 15. [Historique des modifications](#15-historique-des-modifications)
+16. [Integration Claude API](#16-integration-claude-api-claude_processorpy)
+17. [Securite](#points-dattention)
 
 ---
 
@@ -26,10 +28,11 @@
 
 1. **Transfere automatiquement les news** d'un canal source vers un canal de destination avec filtrage intelligent, modifications de texte et support des images
 2. **Diffuse du contenu IPTV** en streaming dans les groupes Telegram via PyTgCalls (WebRTC)
-3. **Offre des commandes admin** pour poster des annonces, programmer des rappels recurrents, et importer des news manuellement
-4. **Envoie toutes les reponses en DM prive** pour garder le canal propre
+3. **Gere des campagnes promotionnelles** programmees (intervalle ou jours specifiques) avec 5 templates
+4. **Offre des commandes admin** pour poster des annonces, programmer des rappels recurrents, et importer des news manuellement
+5. **Envoie toutes les reponses en DM prive** pour garder le canal propre
 
-Le bot tourne 24/7 sur un VPS OVH (Ubuntu 25.04) via un service systemd avec auto-restart.
+Le bot tourne 24/7 sur Railway.app via Docker (Python 3.11 + FFmpeg).
 
 **Identifiants du projet** : configures via variables d'environnement (voir section 11).
 
@@ -40,7 +43,7 @@ Le bot tourne 24/7 sur un VPS OVH (Ubuntu 25.04) via un service systemd avec aut
 ```
 TelegramIPTVBot/
 python-bot/                        # Application principale (production)
-  run_all.py                       # Point d'entree combine (streaming + news + commandes)
+  run_all.py                       # Point d'entree combine (streaming + news + promos + commandes)
   config.py                        # Validation de la configuration au demarrage
   logger.py                        # Logging structure (console + fichier rotatif)
   health.py                        # Serveur HTTP health check (port 8080)
@@ -48,6 +51,7 @@ python-bot/                        # Application principale (production)
   news_cache.py                    # Cache anti-doublon pour les news (fichier JSON)
   news_queue.py                    # File d'attente avec rate limiting (1.5s entre envois)
   reminders.py                     # Gestionnaire de rappels recurrents (fichier JSON)
+  promotions.py                    # Campagnes promo avec scheduling intelligent (fichier JSON)
   utils/retry.py                   # Retry avec backoff exponentiel (1s, 2s, 4s)
   generate_session.py              # Utilitaire pour generer une SESSION_STRING Pyrogram
   get_channel_id.py                # Utilitaire pour trouver l'ID d'un canal Telegram
@@ -76,7 +80,7 @@ deploy/                            # Scripts de deploiement VPS
 | pyrofork | 2.3.58 | Client utilisateur Pyrogram (ecoute canaux, lecture historique) |
 | py-tgcalls | 2.2.10 | Streaming audio/video dans les vocal chats Telegram (WebRTC) |
 | python-dotenv | - | Chargement des variables d'environnement depuis `.env` |
-| requests | - | Requetes HTTP vers l'API IPTV (Xtream Codes) |
+| aiohttp | - | Requetes HTTP async vers l'API IPTV et health check |
 | tgcrypto | - | Cryptographie Telegram (accelere les operations) |
 | aiohttp | - | Serveur HTTP asynchrone pour le health check |
 
@@ -445,7 +449,7 @@ Le bot communique avec un serveur IPTV via l'API Xtream Codes :
 | `GET /live/{user}/{pass}/{stream_id}.ts` | URL du flux live |
 
 - Les categories et chaines sont cachees en memoire pour eviter les appels repetes
-- Chaque appel API utilise `retry_sync()` avec backoff exponentiel (3 tentatives, delais 1s → 2s → 4s)
+- Les appels API utilisent `aiohttp` (async natif, ne bloque pas l'event loop)
 
 ### 6.3 Parametres FFmpeg
 
@@ -495,6 +499,11 @@ Les commandes `/categories` et `/cat` paginent les resultats :
 | `/reminder` | `<intervalle> <message>` | Admin uniquement | Programme un rappel recurrent (ex: 36h, 2d) |
 | `/reminders` | - | Admin uniquement | Liste tous les rappels actifs |
 | `/delreminder` | `<id>` | Admin uniquement | Supprime un rappel |
+| `/promos` | - | Admin uniquement | Panel interactif des campagnes promo (boutons inline) |
+| `/addpromo` | `template/interval/days ...` | Admin uniquement | Creer une campagne promo |
+| `/editpromo` | `<id> <message>` | Admin uniquement | Modifier le message d'une promo |
+| `/delpromo` | `<id>` | Admin uniquement | Supprimer une campagne promo |
+| `/testlistener` | - | Admin uniquement | Diagnostiquer le handler on_message Pyrogram |
 
 **Important** : Toutes les reponses sont envoyees en DM prive a l'utilisateur, jamais dans le canal.
 
@@ -540,6 +549,47 @@ Les rappels sont des messages recurrents envoyes automatiquement dans le canal `
 ### 8.4 Persistance
 
 Les rappels survivent aux redemarrages du bot car ils sont sauvegardes dans un fichier JSON. Au demarrage, le `reminder_worker` recharge les rappels et reprend la ou il s'est arrete.
+
+### 8.5 Systeme de campagnes promotionnelles (promotions.py)
+
+Systeme avance de promos programmees avec scheduling intelligent et boutons inline.
+
+**2 types de planning** :
+
+| Type | Parametres | Comportement |
+|------|-----------|--------------|
+| `interval` | intervalle + heure | Envoie si intervalle ecoule ET heure dans fenetre [send_hour, send_hour+2h] |
+| `weekdays` | jours + heure | Envoie si bon jour ET heure dans fenetre [send_hour, send_hour+1h] ET pas deja envoye aujourd'hui |
+
+**5 templates pre-configures** :
+
+| Template | Schedule | Heure |
+|----------|----------|-------|
+| `free_trial` | Toutes les 48h | 11h |
+| `renewal` | Tous les 3 jours | 18h |
+| `weekend_deal` | Vendredi + Samedi | 12h |
+| `sport_promo` | Jeudi + Vendredi | 17h |
+| `new_user` | Tous les 4 jours | 10h |
+
+**Commandes** :
+```
+/promos                                → Panel interactif avec boutons inline
+/addpromo template free_trial          → Creer depuis template
+/addpromo interval 48h 11 Message      → Promo toutes les 48h vers 11h
+/addpromo days weekends 12 Message     → Promo samedi+dimanche vers 12h
+/editpromo <id> <nouveau texte>        → Modifier le message
+/delpromo <id>                         → Supprimer
+```
+
+**Jours acceptes** : `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`, `weekends`, `weekdays`, `daily`
+
+**Panel inline** (`/promos`) : boutons pour pause/resume, preview, supprimer, creer depuis template ou custom.
+
+**Worker** : `promo_worker` verifie toutes les 60s si une promo doit etre envoyee.
+
+**Persistance** : `promotions.json` survit aux redemarrages.
+
+**Timezone** : configurable via `TZ_OFFSET_HOURS` (defaut 0 = UTC).
 
 ---
 
@@ -588,7 +638,6 @@ Serveur HTTP asynchrone (aiohttp) sur le port 8080.
 ### 9.5 utils/retry.py — Retry avec backoff exponentiel
 
 ```python
-retry_sync(func, max_retries=3, base_delay=1)   # Pour les fonctions sync (API IPTV)
 retry_async(func, max_retries=3, base_delay=1)   # Pour les fonctions async
 ```
 
@@ -826,21 +875,21 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 | Commit | Description |
 |--------|-------------|
-| `9c24ac8` | Fix post_init non execute en mode polling manuel — appel explicite apres start_polling |
-| `7009242` | Deplacement des fichiers morts vers archive/ + suppression infos personnelles dans la doc |
+| `ca2d180` | Fix boutons inline promos : ajout callback_query a allowed_updates |
+| `c944ba8` | Phases 2 + 1.2-1.5 + 5 : securite (sanitize_url), config, migration aiohttp |
+| `339f6ae` | Phase 1.1 + Phase 4 : nettoyage fichiers morts + integration systeme promo |
+| `d207772` | Mise a jour documentation avec optimisation Claude regex-first |
+| `9c24ac8` | Fix post_init non execute en mode polling manuel |
+| `7009242` | Deplacement des fichiers morts vers archive/ + suppression infos personnelles |
 | `6d6b094` | Optimisation Claude API : skip si message matche un pattern regex connu |
-| `43d0a90` | Fix 8 problemes audit : guard anti-doublon dans les handlers, pytgcalls null check, requests.get async, news_cache timing, budget Claude, etc. |
-| `b1624d3` | Fix nixpacks.toml : lance run_all.py au lieu de bot.py |
-| `2e965d9` | Mise a jour doc Railway + fix double reply (is_automatic_forward) |
+| `43d0a90` | Fix 8 problemes audit : guard anti-doublon, pytgcalls null check, aiohttp, news_cache timing |
 | `3ac10b6` | Refonte news: integration Claude API + fix asyncio on_message + /testlistener |
-| `892d826` | Ajout auto-import des news toutes les 2h (news_poll_worker) comme fallback du on_message |
-| `544f690` | Ajout commandes /announcement et /reminder pour gestion admin du canal |
-| `1cbc42e` | Fix recursion infinie dans reply_private + ajout logs diagnostic news |
-| `e7955f1` | Toutes les reponses aux commandes envoyees en DM prive |
-| `3a4dccf` | Remplacement "Dear Reseller(s)" par "Dear Users" dans les news |
-| `b790191` | Ajout commande /importnews pour import manuel des news (admin) |
-| `629f228` | Pagination des categories et chaines en plusieurs messages |
-| `a5b36b7` | SESSION_STRING et identifiants IPTV rendus optionnels pour mode test |
+| `892d826` | Ajout auto-import des news toutes les 2h (news_poll_worker) |
+| `544f690` | Ajout commandes /announcement et /reminder |
+| `e7955f1` | Reponses aux commandes en DM prive |
+| `3a4dccf` | Remplacement "Dear Reseller(s)" par "Dear Users" |
+| `b790191` | Ajout commande /importnews |
+| `629f228` | Pagination des categories et chaines |
 
 ---
 
@@ -893,12 +942,18 @@ Les anciennes fonctions `should_forward_news()` et `modify_news_message()` sont 
 
 4. **DM prives** : L'utilisateur doit avoir fait `/start` en prive avec le bot au moins une fois pour recevoir les reponses.
 
-5. **Fichiers de persistance** : `news_cache.json`, `stream_state.json` et `reminders.json` sont crees automatiquement dans le working directory et survivent aux redemarrages.
+5. **Fichiers de persistance** : `news_cache.json`, `stream_state.json`, `reminders.json` et `promotions.json` sont crees automatiquement dans le working directory et survivent aux redemarrages. Tous sont dans le `.gitignore`.
 
-6. **Deploiement Railway** : Le bot tourne sur Railway.app via Docker. Les variables d'environnement sont gerees dans le dashboard Railway, pas dans un fichier .env.
+6. **Securite IPTV** : La fonction `sanitize_url()` masque les credentials IPTV (user/pass) dans tous les logs et messages utilisateur. Les URLs passees a PyTgCalls restent completes pour le streaming.
 
-7. **Bug reponses en double (RESOLU)** : Le check `_is_duplicate_update()` en haut de chaque handler ignore les messages auto-forwarded depuis un channel lie. Plus de doublons.
+7. **Code nettoye** : Les fichiers morts ont ete supprimes (Node.js, WordPress plugin, archive, doublons racine). Seul `python-bot/` contient le code de production. Tous les chemins de demarrage (Dockerfile, Procfile, nixpacks.toml) pointent vers `python-bot/run_all.py`.
 
-8. **Bug on_message** : Le transfert automatique en temps reel via le handler Pyrogram peut ne pas se declencher. Le workaround `news_poll_worker` (polling toutes les 2h avec `get_chat_history()`) garantit que les messages sont transferes au plus tard 2h apres leur publication. Pour tester si l'on_message fonctionne en temps reel : `/testlistener` (admin uniquement).
+8. **Deploiement Railway** : Le bot tourne sur Railway.app via Docker. Les variables d'environnement sont gerees dans le dashboard Railway, pas dans un fichier .env.
 
-9. **Optimisation Claude API** : Les messages qui matchent les patterns regex connus sont traites directement sans appel API. Claude n'est appele que pour les messages ambigus (pannes, urgences, etc.). Cout estime : ~$0.003 par appel.
+9. **Bug reponses en double (RESOLU)** : Le check `_is_duplicate_update()` en haut de chaque handler ignore les messages auto-forwarded depuis un channel lie. Plus de doublons.
+
+10. **Bug on_message** : Le transfert automatique en temps reel via le handler Pyrogram peut ne pas se declencher. Le workaround `news_poll_worker` (polling toutes les 2h) garantit que les messages sont transferes. `/testlistener` pour diagnostiquer.
+
+11. **Optimisation Claude API** : Les messages qui matchent les patterns regex connus sont traites directement sans appel API. Claude n'est appele que pour les messages ambigus. Cout estime : ~$0.003 par appel.
+
+12. **Campagnes promo** : Le `promo_worker` verifie toutes les 60s si une promo doit etre envoyee. Les templates sont modifiables dans `promotions.py`. Le timezone est configurable via `TZ_OFFSET_HOURS`.
