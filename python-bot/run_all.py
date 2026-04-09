@@ -26,7 +26,7 @@ from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
 import aiohttp
 from health import HealthCheck
 from stream_state import save_state, load_state, clear_state
-from news_cache import NewsCache
+from news_cache import NewsCache, compute_content_hash
 from news_queue import NewsQueue
 from reminders import load_reminders, add_reminder, delete_reminder, get_due_reminders, mark_sent, parse_interval, format_interval
 from claude_processor import process_message, process_message_batch, CONFIDENCE_THRESHOLD
@@ -60,7 +60,27 @@ IPTV_PASS = os.getenv("IPTV_PASSWORD")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # Configuration News Forwarder (configurable via .env)
-NEWS_SOURCE_CHANNEL = int(os.getenv("NEWS_SOURCE_CHANNEL", "-1001763758614"))
+def _parse_news_sources():
+    """
+    Recupere la liste des canaux source news.
+    Supporte deux formats :
+      - NEWS_SOURCE_CHANNELS (nouveau, pluriel) : "id1,id2,id3"
+      - NEWS_SOURCE_CHANNEL  (ancien, singulier) : "id1"  → retrocompatibilite
+    Retourne une liste d'ints.
+    """
+    plural = os.getenv("NEWS_SOURCE_CHANNELS", "").strip()
+    if plural:
+        try:
+            return [int(x.strip()) for x in plural.split(",") if x.strip()]
+        except ValueError as e:
+            logger.critical(f"NEWS_SOURCE_CHANNELS contient une valeur invalide : {e}")
+            raise
+    singular = os.getenv("NEWS_SOURCE_CHANNEL", "-1001763758614").strip()
+    return [int(singular)]
+
+
+NEWS_SOURCE_CHANNELS = _parse_news_sources()
+NEWS_SOURCE_CHANNEL = NEWS_SOURCE_CHANNELS[0]
 NEWS_DEST_CHANNEL = os.getenv("NEWS_DEST_CHANNEL", "@bingebeartv_live")
 
 # Patterns pour filtrer les messages (uniquement annonces en anglais)
@@ -207,9 +227,16 @@ async def forward_news(client: Client, message: Message):
     if not text.strip():
         return
 
-    # Anti-doublon
-    if news_cache.is_forwarded(message.id):
-        logger.debug(f"[NEWS-RT] Message {message.id} deja dans le cache — skip")
+    # Dedup niveau 1 : ce message source a-t-il deja ete traite ?
+    if news_cache.is_source_seen(message.chat.id, message.id):
+        logger.debug(f"[NEWS-RT] Message {message.chat.id}:{message.id} deja dans le cache — skip")
+        return
+
+    # Dedup niveau 2 : ce contenu a-t-il deja ete envoye depuis un autre canal ?
+    content_hash = compute_content_hash(text)
+    if news_cache.is_content_seen(content_hash):
+        logger.info(f"[NEWS-RT] [DEDUP-CONTENT] Message {message.chat.id}:{message.id} a un contenu deja envoye — skip")
+        news_cache.mark_source_seen(message.chat.id, message.id)
         return
 
     # Traitement via Claude (avec fallback regex)
@@ -244,6 +271,7 @@ async def forward_news(client: Client, message: Message):
                     pass
         else:
             msg_id = message.id
+            chan_id = message.chat.id
 
             async def send_text():
                 await telegram_bot.send_message(
@@ -252,18 +280,21 @@ async def forward_news(client: Client, message: Message):
                 )
                 logger.info(f"[NEWS-RT] Message envoye vers {NEWS_DEST_CHANNEL}")
                 health.last_news_forwarded = time.time()
-                news_cache.mark_forwarded(msg_id)
+                news_cache.mark_source_seen(chan_id, msg_id)
+                news_cache.mark_content_seen(content_hash)
 
             await news_queue.enqueue(send_text)
-            return  # mark_forwarded sera appele dans le callback
+            return  # mark_source_seen sera appele dans le callback
 
     # Cacher dans tous les cas (transfere via photo ou non transfere)
-    news_cache.mark_forwarded(message.id)
+    news_cache.mark_source_seen(message.chat.id, message.id)
+    news_cache.mark_content_seen(content_hash)
 
 
 # Enregistrer le handler news seulement si le client utilisateur est disponible
 if HAS_USER_CLIENT and user_client:
-    user_client.on_message(filters.chat(NEWS_SOURCE_CHANNEL))(forward_news)
+    user_client.on_message(filters.chat(NEWS_SOURCE_CHANNELS))(forward_news)
+    logger.info(f"Handler news enregistre pour {len(NEWS_SOURCE_CHANNELS)} canal(aux): {NEWS_SOURCE_CHANNELS}")
 
 
 # ============== STREAMING BOT FUNCTIONS ==============
@@ -621,56 +652,71 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     claude_calls = 0
 
     try:
-        async for message in user_client.get_chat_history(NEWS_SOURCE_CHANNEL):
-            # Arreter si le message est trop ancien
-            if message.date.replace(tzinfo=None) < since_date:
-                break
+        for source_channel in NEWS_SOURCE_CHANNELS:
+            try:
+                async for message in user_client.get_chat_history(source_channel):
+                    if message.date.replace(tzinfo=None) < since_date:
+                        break
 
-            text = message.text or message.caption or ""
-            if not text:
-                continue
+                    text = message.text or message.caption or ""
+                    if not text:
+                        continue
 
-            # Verifier si deja transfere
-            if news_cache.is_forwarded(message.id):
-                skipped += 1
-                continue
+                    # Dedup niveau 1 : message source deja vu ?
+                    if news_cache.is_source_seen(source_channel, message.id):
+                        skipped += 1
+                        continue
 
-            # Traitement via Claude (avec fallback regex)
-            should_fwd, modified_text, category = await process_news_message(text)
-            claude_calls += 1
+                    # Dedup niveau 2 : contenu deja vu (depuis l'autre canal par exemple) ?
+                    chash = compute_content_hash(text)
+                    if news_cache.is_content_seen(chash):
+                        skipped += 1
+                        news_cache.mark_source_seen(source_channel, message.id)
+                        logger.info(f"[NEWS-IMPORT] [DEDUP-CONTENT] {source_channel}:{message.id} doublon de contenu — skip")
+                        continue
 
-            if should_fwd and modified_text:
-                if message.photo:
-                    photo_path = await message.download()
-                    try:
-                        with open(photo_path, 'rb') as photo_file:
-                            await telegram_bot.send_photo(
+                    # Traitement via Claude (avec fallback regex)
+                    should_fwd, modified_text, category = await process_news_message(text)
+                    claude_calls += 1
+
+                    if should_fwd and modified_text:
+                        if message.photo:
+                            photo_path = await message.download()
+                            try:
+                                with open(photo_path, 'rb') as photo_file:
+                                    await telegram_bot.send_photo(
+                                        chat_id=NEWS_DEST_CHANNEL,
+                                        photo=photo_file,
+                                        caption=modified_text
+                                    )
+                            finally:
+                                try:
+                                    os.remove(photo_path)
+                                except OSError:
+                                    pass
+                        else:
+                            await telegram_bot.send_message(
                                 chat_id=NEWS_DEST_CHANNEL,
-                                photo=photo_file,
-                                caption=modified_text
+                                text=modified_text
                             )
-                    finally:
-                        try:
-                            os.remove(photo_path)
-                        except OSError:
-                            pass
-                else:
-                    await telegram_bot.send_message(
-                        chat_id=NEWS_DEST_CHANNEL,
-                        text=modified_text
-                    )
 
-                imported += 1
-                logger.info(f"Import news: message {message.id} transfere [{category}]")
+                        imported += 1
+                        logger.info(f"Import news: {source_channel}:{message.id} transfere [{category}]")
 
-            news_cache.mark_forwarded(message.id)
+                    news_cache.mark_source_seen(source_channel, message.id)
+                    news_cache.mark_content_seen(chash)
 
-            # Pause anti-rate-limit
-            await asyncio.sleep(1.5 if should_fwd else 0.5)
+                    # Pause anti-rate-limit
+                    await asyncio.sleep(1.5 if should_fwd else 0.5)
+
+            except Exception as e:
+                logger.error(f"[NEWS-IMPORT] Erreur sur canal {source_channel}: {e}")
+                continue
 
         logger.info(f"[NEWS-IMPORT] {claude_calls} appels Claude (~{claude_calls * 0.003:.2f}$ estime)")
         await reply_private(update, context,
             f"Import termine!\n"
+            f"Canaux scrutes: {len(NEWS_SOURCE_CHANNELS)}\n"
             f"Messages importes: {imported}\n"
             f"Deja importes (ignores): {skipped}\n"
             f"Appels Claude: {claude_calls}"
@@ -1287,22 +1333,36 @@ async def news_poll_worker():
             cutoff = datetime.now() - timedelta(hours=3)
             pending_messages = []
 
-            # Phase 1 : Collecter tous les nouveaux messages
-            async for message in user_client.get_chat_history(NEWS_SOURCE_CHANNEL):
-                if message.date.replace(tzinfo=None) < cutoff:
-                    break
-                text = message.text or message.caption or ""
-                if not text.strip():
+            # Phase 1 : Collecter tous les nouveaux messages depuis TOUS les canaux sources
+            for source_channel in NEWS_SOURCE_CHANNELS:
+                try:
+                    async for message in user_client.get_chat_history(source_channel):
+                        if message.date.replace(tzinfo=None) < cutoff:
+                            break
+                        text = message.text or message.caption or ""
+                        if not text.strip():
+                            continue
+                        # Dedup niveau 1 : message source deja vu ?
+                        if news_cache.is_source_seen(source_channel, message.id):
+                            continue
+                        # Dedup niveau 2 : contenu deja vu (autre canal) ?
+                        chash = compute_content_hash(text)
+                        if news_cache.is_content_seen(chash):
+                            logger.info(f"[NEWS-POLL] [DEDUP-CONTENT] {source_channel}:{message.id} doublon de contenu — skip")
+                            news_cache.mark_source_seen(source_channel, message.id)
+                            continue
+                        pending_messages.append({
+                            "id": message.id,
+                            "channel_id": source_channel,
+                            "content_hash": chash,
+                            "text": text,
+                            "has_photo": bool(message.photo),
+                            "message": message,
+                            "date": message.date,
+                        })
+                except Exception as e:
+                    logger.error(f"[NEWS-POLL] Erreur collecte canal {source_channel}: {e}")
                     continue
-                if news_cache.is_forwarded(message.id):
-                    continue
-                pending_messages.append({
-                    "id": message.id,
-                    "text": text,
-                    "has_photo": bool(message.photo),
-                    "message": message,
-                    "date": message.date,
-                })
 
             if not pending_messages:
                 logger.info("[NEWS-POLL] Aucun nouveau message")
@@ -1341,7 +1401,8 @@ async def news_poll_worker():
                         logger.info(f"[NEWS-POLL] Batch de {len(group)} messages envoye [{result['category']}]")
 
                     for m in group:
-                        news_cache.mark_forwarded(m["id"])
+                        news_cache.mark_source_seen(m["channel_id"], m["id"])
+                        news_cache.mark_content_seen(m["content_hash"])
                     await asyncio.sleep(1.5)
 
                 else:
@@ -1375,7 +1436,8 @@ async def news_poll_worker():
                             health.last_news_forwarded = time.time()
                             logger.info(f"[NEWS-POLL] Transfere msg {m['id']} [{category}]")
 
-                        news_cache.mark_forwarded(m["id"])
+                        news_cache.mark_source_seen(m["channel_id"], m["id"])
+                        news_cache.mark_content_seen(m["content_hash"])
                         await asyncio.sleep(1.5 if should_fwd else 0.5)
 
             logger.info(f"[NEWS-POLL] Cycle termine: {imported} envoye(s) depuis {len(pending_messages)} message(s) | appels Claude total: {_claude_calls_total}")
@@ -1464,20 +1526,27 @@ async def post_init(application):
         await pytgcalls.start()
         logger.info("PyTgCalls pret")
 
-        # Verifier l'acces au canal source
-        try:
-            chat = await user_client.get_chat(NEWS_SOURCE_CHANNEL)
-            logger.info(f"Canal source accessible: {chat.title} (id={chat.id})")
+        # Verifier l'acces a CHAQUE canal source
+        accessible_channels = []
+        for source_channel in NEWS_SOURCE_CHANNELS:
             try:
-                member = await user_client.get_chat_member(NEWS_SOURCE_CHANNEL, "me")
-                logger.info(f"Statut dans le canal source: {member.status}")
+                chat = await user_client.get_chat(source_channel)
+                logger.info(f"Canal source accessible: {chat.title} (id={chat.id})")
+                try:
+                    member = await user_client.get_chat_member(source_channel, "me")
+                    logger.info(f"  -> Statut: {member.status}")
+                    accessible_channels.append(source_channel)
+                except Exception as e:
+                    logger.warning(f"  -> Impossible de verifier le statut membre: {e}")
+                    accessible_channels.append(source_channel)
             except Exception as e:
-                logger.warning(f"Impossible de verifier le statut membre: {e}")
-        except Exception as e:
-            logger.error(f"IMPOSSIBLE d'acceder au canal source {NEWS_SOURCE_CHANNEL}: {e}")
-            logger.error("Le compte doit etre ABONNE au canal source pour recevoir les updates!")
+                logger.error(f"IMPOSSIBLE d'acceder au canal source {source_channel}: {e}")
+                logger.error("Le compte doit etre ABONNE a ce canal pour recevoir les updates!")
 
-        logger.info(f"Ecoute canal source: {NEWS_SOURCE_CHANNEL}")
+        if not accessible_channels:
+            logger.critical("AUCUN canal source accessible — le transfert de news ne fonctionnera pas!")
+
+        logger.info(f"Ecoute {len(accessible_channels)}/{len(NEWS_SOURCE_CHANNELS)} canal(aux) source(s)")
         logger.info(f"Destination news: {NEWS_DEST_CHANNEL}")
         logger.info(f"Pyrogram dispatcher actif: {user_client.is_connected}")
         logger.info(f"Handlers Pyrogram enregistres: {len(user_client.dispatcher.groups)}")
