@@ -30,6 +30,7 @@ from news_cache import NewsCache, compute_content_hash
 from news_queue import NewsQueue
 from reminders import load_reminders, add_reminder, delete_reminder, get_due_reminders, mark_sent, parse_interval, format_interval
 from claude_processor import process_message, process_message_batch, CONFIDENCE_THRESHOLD
+from dev_mode import PreviewBot, DevContext
 from promotions import (
     load_promos, add_promo, delete_promo, toggle_promo,
     update_promo_message, get_promo, get_due_promos, mark_promo_sent,
@@ -616,7 +617,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/promos - Panel campagnes promo (admin)\n"
         "/addpromo - Creer une campagne (admin)\n"
         "/editpromo <id> <msg> - Modifier le message (admin)\n"
-        "/delpromo <id> - Supprimer une campagne (admin)"
+        "/delpromo <id> - Supprimer une campagne (admin)\n"
+        "/dev <cmd> [args] - Mode preview admin (DM uniquement)"
     )
 
 
@@ -823,6 +825,194 @@ async def delreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info(f"[REMINDER] Rappel {rid} supprime par {update.effective_user.id}")
     else:
         await reply_private(update, context, f"Rappel {rid} introuvable.")
+
+
+async def dev_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mode dev: execute une commande en redirigeant les envois canal vers le DM admin."""
+    if _is_duplicate_update(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    if not context.args:
+        await reply_private(update, context,
+            "Usage: /dev <commande> [args]\n\n"
+            "Commandes disponibles:\n"
+            "  /dev importnews [jours]   - preview import news\n"
+            "  /dev announcement <texte> - preview annonce\n"
+            "  /dev reminder <id>        - preview rappel\n"
+            "  /dev promo <id|template>  - preview promo\n"
+            "  /dev help                 - cette aide"
+        )
+        return
+
+    sub_cmd = context.args[0].lower()
+    sub_args = context.args[1:]
+    admin_id = update.effective_user.id
+
+    redirect_targets = {
+        NEWS_DEST_CHANNEL,
+        f"@{CHAT_ID}" if not str(CHAT_ID).startswith("@") else CHAT_ID,
+        CHAT_ID,
+    }
+
+    preview_bot = PreviewBot(context.bot, admin_id, redirect_targets)
+    dev_ctx = DevContext(context, preview_bot)
+
+    class _FakeContext:
+        def __init__(self, base, args):
+            self._base = base
+            self.args = args
+            self.bot = base.bot
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    sub_context = _FakeContext(dev_ctx, sub_args)
+
+    await reply_private(update, context, f"🧪 Mode DEV actif — execution de /{sub_cmd}\nLes envois canal sont rediriges ici.")
+
+    try:
+        if sub_cmd == "importnews":
+            if not sub_args:
+                sub_context.args = ["1"]
+            await _dev_run_importnews(update, sub_context)
+
+        elif sub_cmd == "announcement":
+            if not sub_args:
+                await reply_private(update, context, "Usage: /dev announcement <texte>")
+                return
+            await announcement_command(update, sub_context)
+
+        elif sub_cmd == "reminder":
+            if not sub_args:
+                await reply_private(update, context, "Usage: /dev reminder <id>\nUtilise /reminders pour lister.")
+                return
+            await _dev_run_reminder_preview(update, sub_context, sub_args[0])
+
+        elif sub_cmd == "promo":
+            if not sub_args:
+                await reply_private(update, context, "Usage: /dev promo <id|template>")
+                return
+            await _dev_run_promo_preview(update, sub_context, sub_args[0])
+
+        elif sub_cmd == "help":
+            await reply_private(update, context,
+                "Commandes /dev disponibles:\n"
+                "/dev importnews [jours]\n"
+                "/dev announcement <texte>\n"
+                "/dev reminder <id>\n"
+                "/dev promo <id|template>"
+            )
+            return
+
+        else:
+            await reply_private(update, context, f"Commande dev inconnue: {sub_cmd}\nFais /dev help pour voir la liste.")
+            return
+
+        await reply_private(update, context, f"✅ Preview termine.\nMessages interceptes: {preview_bot.intercepted_count}")
+
+    except Exception as e:
+        logger.exception(f"[DEV] Erreur dans /dev {sub_cmd}: {e}")
+        await reply_private(update, context, f"❌ Erreur dev: {e}")
+
+
+async def _dev_run_importnews(update, sub_context):
+    """Variante de importnews qui utilise PreviewBot et ne marque PAS le cache."""
+    if not HAS_USER_CLIENT or not user_client:
+        await reply_private(update, sub_context, "Erreur: client utilisateur non connecte")
+        return
+
+    days = 1
+    if sub_context.args:
+        try:
+            days = int(sub_context.args[0])
+            if days < 1 or days > 7:
+                await reply_private(update, sub_context, "En mode dev, jours entre 1 et 7")
+                return
+        except ValueError:
+            await reply_private(update, sub_context, "Usage: /dev importnews <jours>")
+            return
+
+    since_date = datetime.now() - timedelta(days=days)
+    await reply_private(update, sub_context, f"🧪 [DEV] Preview import news depuis {days} jour(s)...")
+
+    previewed = 0
+    skipped = 0
+    claude_calls = 0
+
+    for source_channel in NEWS_SOURCE_CHANNELS:
+        try:
+            async for message in user_client.get_chat_history(source_channel):
+                if message.date.replace(tzinfo=None) < since_date:
+                    break
+                text = message.text or message.caption or ""
+                if not text:
+                    continue
+
+                should_fwd, modified_text, category = await process_news_message(text)
+                claude_calls += 1
+
+                if should_fwd and modified_text:
+                    if message.photo:
+                        photo_path = await message.download()
+                        try:
+                            with open(photo_path, 'rb') as photo_file:
+                                await sub_context.bot.send_photo(
+                                    chat_id=NEWS_DEST_CHANNEL,
+                                    photo=photo_file,
+                                    caption=f"[{category}] {modified_text}"
+                                )
+                        finally:
+                            try:
+                                os.remove(photo_path)
+                            except OSError:
+                                pass
+                    else:
+                        await sub_context.bot.send_message(
+                            chat_id=NEWS_DEST_CHANNEL,
+                            text=f"[{category}] {modified_text}"
+                        )
+                    previewed += 1
+                else:
+                    skipped += 1
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"[DEV-IMPORT] Erreur sur canal {source_channel}: {e}")
+            continue
+
+    await reply_private(update, sub_context,
+        f"🧪 Preview import termine.\n"
+        f"Messages affiches: {previewed}\n"
+        f"Filtres/skip: {skipped}\n"
+        f"Appels Claude: {claude_calls} (~${claude_calls * 0.003:.2f})"
+    )
+
+
+async def _dev_run_reminder_preview(update, sub_context, reminder_id: str):
+    """Preview un rappel sans modifier last_sent."""
+    reminders = load_reminders()
+    if reminder_id not in reminders:
+        await reply_private(update, sub_context, f"Rappel '{reminder_id}' introuvable. Utilise /reminders.")
+        return
+    msg = reminders[reminder_id]["message"]
+    await sub_context.bot.send_message(chat_id=NEWS_DEST_CHANNEL, text=msg)
+
+
+async def _dev_run_promo_preview(update, sub_context, identifier: str):
+    """Preview d'une promo (par id ou par nom de template)."""
+    promo = get_promo(identifier)
+    if promo:
+        await sub_context.bot.send_message(chat_id=NEWS_DEST_CHANNEL, text=promo["message"])
+        return
+    if identifier in TEMPLATES:
+        await sub_context.bot.send_message(chat_id=NEWS_DEST_CHANNEL, text=TEMPLATES[identifier]["message"])
+        return
+    await reply_private(update, sub_context,
+        f"Promo '{identifier}' introuvable.\n"
+        f"Templates: {', '.join(TEMPLATES.keys())}\n"
+        f"Promos actives: utilise /promos"
+    )
 
 
 async def testlistener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1610,6 +1800,7 @@ async def main():
     application.add_handler(CommandHandler("reminders", reminders_list_command))
     application.add_handler(CommandHandler("delreminder", delreminder_command))
     application.add_handler(CommandHandler("testlistener", testlistener_command))
+    application.add_handler(CommandHandler("dev", dev_command))
     application.add_handler(CommandHandler("promos", promos_command))
     application.add_handler(CommandHandler("addpromo", addpromo_command))
     application.add_handler(CommandHandler("editpromo", editpromo_command))
