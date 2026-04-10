@@ -904,13 +904,17 @@ async def dev_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             await _dev_run_promo_preview(update, sub_context, sub_args[0])
 
+        elif sub_cmd == "article":
+            await _dev_run_article_preview(update, sub_context)
+
         elif sub_cmd == "help":
             await reply_private(update, context,
                 "Commandes /dev disponibles:\n"
                 "/dev importnews [jours]\n"
                 "/dev announcement <texte>\n"
                 "/dev reminder <id>\n"
-                "/dev promo <id|template>"
+                "/dev promo <id|template>\n"
+                "/dev article"
             )
             return
 
@@ -1021,6 +1025,29 @@ async def _dev_run_promo_preview(update, sub_context, identifier: str):
         f"Templates: {', '.join(TEMPLATES.keys())}\n"
         f"Promos actives: utilise /promos"
     )
+
+
+async def _dev_run_article_preview(update, sub_context):
+    """Preview de l'article du matin via le PreviewBot."""
+    article = await fetch_latest_article()
+    if not article:
+        await reply_private(update, sub_context, "Aucun article disponible.")
+        return
+
+    text, photo_url = await build_morning_article_message(article)
+    if photo_url:
+        await sub_context.bot.send_photo(
+            chat_id=NEWS_DEST_CHANNEL,
+            photo=photo_url,
+            caption=text,
+            parse_mode="HTML"
+        )
+    else:
+        await sub_context.bot.send_message(
+            chat_id=NEWS_DEST_CHANNEL,
+            text=text,
+            parse_mode="HTML"
+        )
 
 
 async def postarticle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
