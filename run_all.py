@@ -31,6 +31,13 @@ from news_queue import NewsQueue
 from reminders import load_reminders, add_reminder, delete_reminder, get_due_reminders, mark_sent, parse_interval, format_interval
 from claude_processor import process_message, process_message_batch, CONFIDENCE_THRESHOLD
 from dev_mode import PreviewBot, DevContext
+from articles_feed import (
+    fetch_latest_article,
+    fetch_featured_article_today,
+    build_morning_article_message,
+    build_evening_article_message,
+    mark_article_seen,
+)
 from promotions import (
     load_promos, add_promo, delete_promo, toggle_promo,
     update_promo_message, get_promo, get_due_promos, mark_promo_sent,
@@ -618,6 +625,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addpromo - Creer une campagne (admin)\n"
         "/editpromo <id> <msg> - Modifier le message (admin)\n"
         "/delpromo <id> - Supprimer une campagne (admin)\n"
+        "/postarticle - Poster un article maintenant (admin)\n"
         "/dev <cmd> [args] - Mode preview admin (DM uniquement)"
     )
 
@@ -1013,6 +1021,25 @@ async def _dev_run_promo_preview(update, sub_context, identifier: str):
         f"Templates: {', '.join(TEMPLATES.keys())}\n"
         f"Promos actives: utilise /promos"
     )
+
+
+async def postarticle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force l'envoi immediat du prochain article disponible (admin only)."""
+    if _is_duplicate_update(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_private(update, context, "Non autorise (admin uniquement)")
+        return
+
+    await reply_private(update, context, "Recherche du prochain article...")
+    article = await fetch_latest_article()
+    if not article:
+        await reply_private(update, context, "Aucun article disponible.")
+        return
+
+    await _post_article_to_channel(article, "morning")
+    title = article.get("title", {}).get("rendered", "?")
+    await reply_private(update, context, f"Article poste: {title}")
 
 
 async def testlistener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1507,8 +1534,93 @@ async def reminder_worker(bot):
 
 
 NEWS_POLL_INTERVAL = int(os.getenv("NEWS_POLL_INTERVAL", "7200"))  # 2h par defaut
-CLAUDE_MAX_CALLS_PER_CYCLE = int(os.getenv("CLAUDE_MAX_CALLS_PER_CYCLE", "50"))  # Limite par cycle de poll
+CLAUDE_MAX_CALLS_PER_CYCLE = int(os.getenv("CLAUDE_MAX_CALLS_PER_CYCLE", "50"))
 _claude_calls_total = 0
+
+ARTICLE_MORNING_HOUR = int(os.getenv("ARTICLE_MORNING_HOUR", "9"))
+ARTICLE_EVENING_HOUR = int(os.getenv("ARTICLE_EVENING_HOUR", "18"))
+ARTICLE_WORKER_ENABLED = os.getenv("ARTICLE_WORKER_ENABLED", "true").lower() == "true"
+TZ_OFFSET = int(os.getenv("TZ_OFFSET_HOURS", "0"))
+
+
+async def article_worker():
+    """Worker qui poste 1-2 articles par jour (matin + soir conditionnel)."""
+    if not ARTICLE_WORKER_ENABLED:
+        logger.info("[ARTICLES] Worker desactive via ARTICLE_WORKER_ENABLED=false")
+        return
+
+    logger.info(
+        f"[ARTICLES] Worker demarre — matin {ARTICLE_MORNING_HOUR}h, "
+        f"soir {ARTICLE_EVENING_HOUR}h (TZ offset {TZ_OFFSET}h)"
+    )
+
+    last_morning_date = None
+    last_evening_date = None
+
+    while True:
+        try:
+            now_utc = datetime.utcnow()
+            now_local = now_utc + timedelta(hours=TZ_OFFSET)
+            current_hour = now_local.hour
+            today_str = now_local.strftime("%Y-%m-%d")
+
+            # Post du matin
+            if current_hour == ARTICLE_MORNING_HOUR and last_morning_date != today_str:
+                logger.info("[ARTICLES] Fenetre matin declenchee")
+                article = await fetch_latest_article()
+                if article:
+                    await _post_article_to_channel(article, "morning")
+                    last_morning_date = today_str
+                else:
+                    logger.info("[ARTICLES] Aucun article matin disponible")
+                    last_morning_date = today_str
+
+            # Post du soir (conditionnel)
+            elif current_hour == ARTICLE_EVENING_HOUR and last_evening_date != today_str:
+                logger.info("[ARTICLES] Fenetre soir — verification featured du jour")
+                article = await fetch_featured_article_today()
+                if article:
+                    await _post_article_to_channel(article, "evening")
+                    last_evening_date = today_str
+                else:
+                    logger.info("[ARTICLES] Pas de featured aujourd'hui, skip post soir")
+                    last_evening_date = today_str
+
+        except Exception as e:
+            logger.exception(f"[ARTICLES] Erreur dans worker: {e}")
+
+        await asyncio.sleep(60)
+
+
+async def _post_article_to_channel(article: dict, slot: str):
+    """Helper: poste un article et marque le cache."""
+    try:
+        if slot == "morning":
+            text, photo_url = await build_morning_article_message(article)
+        else:
+            text, photo_url = await build_evening_article_message(article)
+
+        if photo_url:
+            await telegram_bot.send_photo(
+                chat_id=NEWS_DEST_CHANNEL,
+                photo=photo_url,
+                caption=text,
+                parse_mode="HTML"
+            )
+        else:
+            await telegram_bot.send_message(
+                chat_id=NEWS_DEST_CHANNEL,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=False
+            )
+
+        mark_article_seen(article["id"])
+        title = article.get("title", {}).get("rendered", "")[:50]
+        logger.info(f"[ARTICLES] Article poste ({slot}): id={article['id']} title='{title}'")
+
+    except Exception as e:
+        logger.exception(f"[ARTICLES] Erreur lors du post: {e}")
 
 
 async def news_poll_worker():
@@ -1768,6 +1880,10 @@ async def post_init(application):
     asyncio.create_task(promo_worker(application.bot))
     logger.info("[PROMO] Worker de campagnes promotionnelles actif")
 
+    # Lancer le worker articles WordPress
+    asyncio.create_task(article_worker())
+    logger.info("[ARTICLES] Worker articles demarre")
+
     logger.info(f"Groupe cible: @{CHAT_ID}")
 
     # Démarrer le health check HTTP
@@ -1801,6 +1917,7 @@ async def main():
     application.add_handler(CommandHandler("delreminder", delreminder_command))
     application.add_handler(CommandHandler("testlistener", testlistener_command))
     application.add_handler(CommandHandler("dev", dev_command))
+    application.add_handler(CommandHandler("postarticle", postarticle_command))
     application.add_handler(CommandHandler("promos", promos_command))
     application.add_handler(CommandHandler("addpromo", addpromo_command))
     application.add_handler(CommandHandler("editpromo", editpromo_command))

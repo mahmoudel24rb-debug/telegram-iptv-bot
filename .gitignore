@@ -10,6 +10,7 @@ stream_state.json
 news_cache.json
 reminders.json
 promotions.json
+articles_cache.json
 
 # Python
 __pycache__/
