@@ -1602,15 +1602,15 @@ async def article_worker():
                     logger.info("[ARTICLES] Aucun article matin disponible")
                     last_morning_date = today_str
 
-            # Post du soir (conditionnel)
+            # Post du soir (toujours, prochain article non envoye)
             elif current_hour == ARTICLE_EVENING_HOUR and last_evening_date != today_str:
-                logger.info("[ARTICLES] Fenetre soir — verification featured du jour")
-                article = await fetch_featured_article_today()
+                logger.info("[ARTICLES] Fenetre soir declenchee")
+                article = await fetch_latest_article()
                 if article:
                     await _post_article_to_channel(article, "evening")
                     last_evening_date = today_str
                 else:
-                    logger.info("[ARTICLES] Pas de featured aujourd'hui, skip post soir")
+                    logger.info("[ARTICLES] Aucun article soir disponible")
                     last_evening_date = today_str
 
         except Exception as e:
