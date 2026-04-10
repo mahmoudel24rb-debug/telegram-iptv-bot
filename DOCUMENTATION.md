@@ -42,27 +42,22 @@ Le bot tourne 24/7 sur Railway.app via Docker (Python 3.11 + FFmpeg).
 
 ```
 TelegramIPTVBot/
-python-bot/                        # Application principale (production)
-  run_all.py                       # Point d'entree combine (streaming + news + promos + commandes)
+  run_all.py                       # Point d'entree principal (streaming + news + promos)
   config.py                        # Validation de la configuration au demarrage
   logger.py                        # Logging structure (console + fichier rotatif)
   health.py                        # Serveur HTTP health check (port 8080)
-  stream_state.py                  # Persistance d'etat du stream (auto-resume apres crash)
-  news_cache.py                    # Cache anti-doublon pour les news (fichier JSON)
-  news_queue.py                    # File d'attente avec rate limiting (1.5s entre envois)
-  reminders.py                     # Gestionnaire de rappels recurrents (fichier JSON)
-  promotions.py                    # Campagnes promo avec scheduling intelligent (fichier JSON)
-  utils/retry.py                   # Retry avec backoff exponentiel (1s, 2s, 4s)
-  generate_session.py              # Utilitaire pour generer une SESSION_STRING Pyrogram
-  get_channel_id.py                # Utilitaire pour trouver l'ID d'un canal Telegram
+  stream_state.py                  # Persistance d'etat du stream (auto-resume)
+  news_cache.py                    # Cache double index (source + contenu) anti-doublon
+  news_queue.py                    # File d'attente avec rate limiting (1.5s)
+  reminders.py                     # Gestionnaire de rappels recurrents
+  promotions.py                    # Campagnes promo avec scheduling intelligent
+  claude_processor.py              # Integration Claude API pour analyse des news
+  utils/retry.py                   # Retry avec backoff exponentiel
+  generate_session.py              # Utilitaire generation SESSION_STRING
+  get_channel_id.py                # Utilitaire decouverte ID canal
   requirements.txt                 # Dependances Python
-  .env                             # Variables d'environnement (non commite)
+  Dockerfile                       # Image Docker (Python 3.11 + FFmpeg)
   .env.example                     # Template de configuration
-deploy/                            # Scripts de deploiement VPS
-  setup-vps.sh                     # Installation initiale du VPS Ubuntu
-  setup-monitoring.sh              # Configuration monitoring + cron
-  monitor.sh                       # Health check + auto-recovery (cron 5 min)
-  update-bot.sh                    # Mise a jour et redemarrage
 ```
 
 ### Fichiers de persistance crees a l'execution (dans python-bot/)
@@ -306,11 +301,12 @@ Message dans le canal source (-1001763758614)
     - Envoye via le BOT (telegram_bot), pas via le user_client
     |
     v
-[ETAPE 9] Marquage dans le cache
-    news_cache.mark_forwarded(message.id)
-    - Ajoute message_id + timestamp dans news_cache.json
-    - Si le cache depasse 500 entrees, supprime les plus anciennes (FIFO)
-    - Persiste sur disque immediatement
+[ETAPE 9] Marquage dans le cache (double index)
+    news_cache.mark_source_seen(channel_id, message.id)
+    news_cache.mark_content_seen(content_hash)
+    - Index 1 : "channel_id:msg_id" → timestamp
+    - Index 2 : hash du contenu normalise → timestamp
+    - Max 1000 entrees par index, TTL 7 jours
 ```
 
 ### 5.3 Exemple concret de transformation
@@ -355,30 +351,41 @@ Team BingeBearTV
 3. "Team 8K" → "Team BingeBearTV"
 4. Sauts de ligne excessifs → nettoyes
 
-### 5.4 Le cache anti-doublon (news_cache.py)
+### 5.4 Le cache anti-doublon a double index (news_cache.py)
 
 **Fichier** : `news_cache.json`
 
 **Format** :
 ```json
 {
-  "3476": 1710547717.5,
-  "3475": 1710547719.0,
-  "3480": 1710634051.2
+  "by_source": {
+    "-1001763758614:3476": 1710547717.5,
+    "-1001832390123:500": 1710634051.2
+  },
+  "by_hash": {
+    "a1b2c3d4e5f6g7h8": 1710547717.5
+  }
 }
 ```
 
-Chaque entree = `message_id` (string) → `timestamp` (float, moment du transfert)
+**Double deduplication** :
+
+| Niveau | Cle | Role |
+|--------|-----|------|
+| 1. Source | `"channel_id:message_id"` | Evite de retraiter le meme message d'un canal donne |
+| 2. Contenu | `md5(texte_normalise)[:16]` | Evite d'envoyer 2x la meme info entre canaux |
+
+**Dedup de contenu** : le texte est normalise (minuscules, sans URLs, sans ponctuation, sans mots de bruit comme "Dear Users", "BingeBearTV") puis hashe en MD5. Si deux canaux postent le meme contenu avec un wording legerement different, le hash sera identique et le doublon sera bloque.
 
 **Comportement** :
-- Au chargement : filtre les entrees > 7 jours (TTL)
-- `is_forwarded(id)` : verifie si l'ID existe dans le cache
-- `mark_forwarded(id)` : ajoute l'ID + sauvegarde immediatement
-- Si > 500 entrees : supprime les plus anciennes (tri par timestamp, garde les 500 plus recentes)
-- Taille typique du fichier : ~25 KB maximum
-- Persiste entre les redemarrages du bot
+- `is_source_seen(channel_id, msg_id)` : verifie index 1 + fallback legacy
+- `is_content_seen(hash)` : verifie index 2 (hash vide → toujours False)
+- `mark_source_seen(channel_id, msg_id)` : marque dans index 1
+- `mark_content_seen(hash)` : marque dans index 2
+- Max 1000 entrees par index, TTL 7 jours
+- Migration automatique depuis l'ancien format (dict plat `{msg_id: timestamp}`)
 
-**Pourquoi c'est important** : Sans le cache, le news_poll_worker (toutes les 2h) re-enverrait tous les messages a chaque execution. Le cache garantit qu'un message n'est JAMAIS envoye deux fois.
+**Important** : le cache est en memoire + fichier JSON. Sur Railway, le fichier est perdu a chaque redeploiement (pas de volume persistant). Le premier cycle de poll apres un deploy peut renvoyer des messages deja envoyes.
 
 ### 5.5 La file d'attente (news_queue.py)
 
@@ -394,8 +401,8 @@ Utilisee uniquement par le mecanisme 1 (on_message). Le mecanisme 2 (poll) fait 
 ### 5.6 Configuration du transfert de news
 
 ```env
-# Canal source (ID numerique negatif du canal Telegram)
-NEWS_SOURCE_CHANNEL=-1001763758614
+# Liste des canaux sources separes par virgules (supporte N canaux)
+NEWS_SOURCE_CHANNELS=-1001763758614,-1001832390123
 
 # Canal destination (username avec @)
 NEWS_DEST_CHANNEL=@bingebeartv_live
@@ -697,12 +704,14 @@ IPTV_PASSWORD=<iptv_pass>                    # Mot de passe IPTV
 ```env
 ADMIN_IDS=<telegram_user_ids>                # IDs Telegram des admins (virgules)
 ALLOWED_USERNAMES=<usernames>                # Usernames autorises pour le streaming
-NEWS_SOURCE_CHANNEL=<channel_id>             # ID du canal source des news
+NEWS_SOURCE_CHANNELS=<id1>,<id2>             # Canaux sources news (virgules, supporte N canaux)
+NEWS_SOURCE_CHANNEL=<channel_id>             # Ancien format (fallback si CHANNELS absent)
 NEWS_DEST_CHANNEL=@<channel_username>        # Canal de destination des news
 NEWS_POLL_INTERVAL=7200                      # Intervalle polling news en secondes (defaut 2h)
-LOG_DIR=/var/log/bingebear                   # Repertoire des logs
+CLAUDE_MAX_CALLS_PER_CYCLE=50               # Limite appels Claude par cycle de poll
+TZ_OFFSET_HOURS=0                           # Offset timezone pour les promos (defaut UTC)
+LOG_DIR=./logs                              # Repertoire des logs
 HEALTH_PORT=8080                             # Port du serveur health check
-STREAM_STATE_MAX_AGE=1800                    # Duree max etat sauvegarde (30 min)
 ```
 
 ---
@@ -875,6 +884,8 @@ Le `news_poll_worker` toutes les 2 heures contourne le probleme en utilisant `ge
 
 | Commit | Description |
 |--------|-------------|
+| `efe3e1b` | Fix migration : check legacy cache entries dans is_source_seen |
+| `412a008` | Multi-canaux sources news + dedup contenu (double index cache) |
 | `ca2d180` | Fix boutons inline promos : ajout callback_query a allowed_updates |
 | `c944ba8` | Phases 2 + 1.2-1.5 + 5 : securite (sanitize_url), config, migration aiohttp |
 | `339f6ae` | Phase 1.1 + Phase 4 : nettoyage fichiers morts + integration systeme promo |

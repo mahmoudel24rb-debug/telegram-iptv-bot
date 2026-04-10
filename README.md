@@ -1,15 +1,16 @@
 # BingeBear TV Bot
 
-Bot Telegram multifonction pour BingeBear TV : streaming IPTV via PyTgCalls, transfert de news avec analyse IA Claude, rappels recurrents, campagnes promotionnelles, et plus.
+Bot Telegram multifonction pour BingeBear TV : streaming IPTV via PyTgCalls, transfert de news multi-canaux avec analyse IA Claude et dedup de contenu, rappels recurrents, campagnes promotionnelles.
 
 ## Fonctionnalites
 
-- **Streaming IPTV** dans les vocal chats Telegram via PyTgCalls (WebRTC)
-- **Transfert automatique de news** depuis un canal source vers `@bingebeartv_live`
+- **Transfert automatique de news** depuis plusieurs canaux source vers le canal destination
+  - Deduplication double index (source + contenu) anti-doublons entre canaux
   - Filtrage regex rapide pour les patterns connus
-  - Analyse Claude API pour les messages ambigus (pannes, urgences, etc.)
-  - Polling automatique toutes les 2h en backup
-- **Campagnes promotionnelles** programmees (intervalle ou jours specifiques)
+  - Analyse Claude API pour les messages ambigus (pannes, urgences)
+  - Polling automatique toutes les 2h
+- **Streaming IPTV** dans les vocal chats Telegram via PyTgCalls (WebRTC)
+- **Campagnes promotionnelles** programmees (intervalle ou jours specifiques, 5 templates)
 - **Rappels recurrents** configurables
 - **Annonces admin** dans le canal
 - **Reponses en DM prive** pour garder le canal propre
@@ -17,100 +18,56 @@ Bot Telegram multifonction pour BingeBear TV : streaming IPTV via PyTgCalls, tra
 ## Architecture
 
 ```
-TelegramIPTVBot/
-  python-bot/              # Code de production (deploye sur Railway)
-    run_all.py             # Point d'entree principal
-    promotions.py          # Module campagnes promo
-    claude_processor.py    # Integration Claude API
-    reminders.py           # Module rappels recurrents
-    news_cache.py          # Cache anti-doublon
-    news_queue.py          # File rate-limited
-    stream_state.py        # Auto-resume du stream
-    health.py              # HTTP health check
-    config.py              # Validation env
-    logger.py              # Logging structure
-    utils/retry.py         # Retry exponential backoff
-    Dockerfile             # Image Docker (Python 3.11 + FFmpeg)
-    requirements.txt       # Dependances Python
-    .env.example           # Template configuration
-  Dockerfile               # Build racine (copie python-bot/)
-  Procfile                 # Pour Heroku/Railway worker
-  nixpacks.toml            # Config Nixpacks (Railway)
-  docker-compose.yml       # Pour deploiement Docker local
-  DOCUMENTATION.md         # Documentation technique complete
-  PLAN.md                  # Plan de refactoring
-  deploy/                  # Scripts VPS (legacy, archive)
+run_all.py              # Point d'entree principal
+news_cache.py           # Cache double index (source + contenu)
+claude_processor.py     # Integration Claude API
+promotions.py           # Campagnes promo + scheduling
+reminders.py            # Rappels recurrents
+news_queue.py           # File rate-limited
+stream_state.py         # Auto-resume stream
+health.py               # HTTP health check
+config.py               # Validation env
+logger.py               # Logging structure
+utils/retry.py          # Retry exponential backoff
+Dockerfile              # Image Docker (Python 3.11 + FFmpeg)
+requirements.txt        # Dependances Python
+.env.example            # Template configuration
+DOCUMENTATION.md        # Documentation technique complete
 ```
 
 ## Deploiement (Railway)
 
-Le bot tourne sur Railway via le Dockerfile dans `python-bot/`.
-
 ```bash
-# Installer le CLI Railway
 npm install -g @railway/cli
-
-# Se connecter
 railway login
-
-# Depuis le dossier python-bot/
-cd python-bot
 railway init
 railway up
-
-# Configurer les variables d'environnement
 railway variables set BOT_TOKEN=... API_ID=... ...
-
-# Voir les logs
 railway logs
 ```
 
 ## Configuration
 
-Toutes les variables d'environnement sont documentees dans `python-bot/.env.example`. Les variables requises :
+Variables d'environnement (voir `.env.example`) :
 
-- `API_ID`, `API_HASH` (Telegram, depuis my.telegram.org)
-- `BOT_TOKEN` (depuis @BotFather)
-- `CHAT_ID` (username du groupe/canal cible)
-- `SESSION_STRING` (genere via `python-bot/generate_session.py`)
-- `IPTV_SERVER_URL`, `IPTV_USERNAME`, `IPTV_PASSWORD`
-- `ANTHROPIC_API_KEY` (optionnel, pour l'analyse Claude des news)
+**Requises** : `API_ID`, `API_HASH`, `BOT_TOKEN`, `CHAT_ID`, `SESSION_STRING`
 
-## Commandes du bot
+**News** : `NEWS_SOURCE_CHANNELS` (liste d'IDs separes par virgules), `NEWS_DEST_CHANNEL`, `ANTHROPIC_API_KEY` (optionnel)
 
-### Streaming IPTV
-- `/categories` — Liste des categories
-- `/cat <id>` — Chaines d'une categorie
-- `/play <id>` — Lancer un stream
-- `/stop` — Arreter le stream
-- `/status` — Statut actuel
-- `/test` — Test stream (Big Buck Bunny)
+**IPTV** : `IPTV_SERVER_URL`, `IPTV_USERNAME`, `IPTV_PASSWORD`
 
-### News
-- `/importnews [jours]` — Importer les news depuis X jours (admin)
-- `/announcement <msg>` — Poster dans le canal (admin)
+## Commandes
 
-### Rappels recurrents
-- `/reminder <intervalle> <msg>` — Creer un rappel (admin)
-- `/reminders` — Liste des rappels (admin)
-- `/delreminder <id>` — Supprimer (admin)
+| Commande | Description |
+|----------|-------------|
+| `/categories` | Liste des categories IPTV |
+| `/cat <id>` | Chaines d'une categorie |
+| `/play <id>` | Lancer un stream |
+| `/stop` | Arreter le stream |
+| `/importnews [jours]` | Importer les news (admin) |
+| `/announcement <msg>` | Poster dans le canal (admin) |
+| `/promos` | Panel campagnes promo (admin) |
+| `/addpromo` | Creer une campagne (admin) |
+| `/reminder <intervalle> <msg>` | Rappel recurrent (admin) |
 
-### Campagnes promotionnelles
-- `/promos` — Panel admin avec boutons inline
-- `/addpromo template <nom>` — Creer depuis un template
-- `/addpromo interval <freq> <heure> <msg>` — Promo a intervalle
-- `/addpromo days <jours> <heure> <msg>` — Promo sur jours specifiques
-- `/editpromo <id> <msg>` — Modifier une promo
-- `/delpromo <id>` — Supprimer une promo
-
-### Diagnostic
-- `/testlistener` — Tester le handler on_message Pyrogram (admin)
-- `/help` — Liste de toutes les commandes
-
-## Documentation
-
-Pour plus de details sur l'architecture, les bugs connus, les choix techniques, voir [DOCUMENTATION.md](DOCUMENTATION.md).
-
-## Licence
-
-Usage prive — BingeBear TV.
+Voir [DOCUMENTATION.md](DOCUMENTATION.md) pour la documentation technique complete.
