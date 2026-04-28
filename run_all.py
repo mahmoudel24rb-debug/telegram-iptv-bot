@@ -185,41 +185,36 @@ async def process_news_message(raw_text: str) -> tuple:
     """
     Traite un message news : decide s'il faut le transferer et le reecrit.
 
-    Strategie :
-    1. Si le message matche les patterns regex connus → traitement regex direct (pas d'appel API)
-    2. Si le message est exclu par les mots interdits → skip direct (pas d'appel API)
-    3. Sinon → appel Claude API pour les messages ambigus (pannes, urgences, etc.)
-    4. Si Claude est indisponible → skip (les patterns connus sont deja traites en 1)
-
     Returns:
-        (should_forward, modified_text, category)
+        (should_forward, modified_text, category, claude_failed)
+        claude_failed=True si Claude a plante (pour NE PAS marquer le cache et reessayer plus tard)
     """
     global _claude_calls_total
 
-    # ── Etape 1 : Exclusion rapide (mots interdits) ──
+    # Etape 1 : Exclusion rapide
     for exclude in NEWS_EXCLUDE_WORDS:
         if exclude.lower() in raw_text.lower():
-            return False, None, "excluded"
+            return False, None, "excluded", False
 
-    # ── Etape 2 : Match regex connu → traitement direct sans Claude ──
+    # Etape 2 : Match regex connu
     if should_forward_news(raw_text):
         modified = modify_news_message(raw_text)
-        logger.info("[NEWS] Message matche pattern regex — traitement direct (pas d'appel Claude)")
-        return True, modified, "regex_match"
+        logger.info("[NEWS] Message matche pattern regex — traitement direct")
+        return True, modified, "regex_match", False
 
-    # ── Etape 3 : Message ambigu → appel Claude API ──
+    # Etape 3 : Appel Claude API
     _claude_calls_total += 1
     result = await process_message(raw_text)
 
     if result is not None:
         if result["should_forward"] and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD:
-            return True, result["rewritten_message"], result["category"]
+            return True, result["rewritten_message"], result["category"], False
         else:
-            return False, None, result.get("category")
+            return False, None, result.get("category"), False
 
-    # ── Claude indisponible et pas de match regex → skip ──
-    logger.debug("[NEWS] Pas de match regex et Claude indisponible — skip")
-    return False, None, None
+    # Claude indisponible — NE PAS marquer le cache pour reessayer plus tard
+    logger.warning("[NEWS] Claude indisponible — message non marque, sera reessaye au prochain cycle")
+    return False, None, None, True
 
 
 async def forward_news(client: Client, message: Message):
@@ -248,7 +243,12 @@ async def forward_news(client: Client, message: Message):
         return
 
     # Traitement via Claude (avec fallback regex)
-    should_forward, modified_text, category = await process_news_message(text)
+    should_forward, modified_text, category, claude_failed = await process_news_message(text)
+
+    # Si Claude a plante, ne PAS marquer le cache pour reessayer plus tard
+    if claude_failed:
+        logger.warning(f"[NEWS-RT] Message {message.id} non traite (Claude down) — sera reessaye")
+        return
 
     logger.info(f"[NEWS-RT] Message {message.id} | forward={should_forward} | cat={category}")
 
@@ -686,8 +686,14 @@ async def importnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         continue
 
                     # Traitement via Claude (avec fallback regex)
-                    should_fwd, modified_text, category = await process_news_message(text)
+                    should_fwd, modified_text, category, claude_failed = await process_news_message(text)
                     claude_calls += 1
+
+                    # Si Claude a plante, ne PAS marquer le cache pour reessayer plus tard
+                    if claude_failed:
+                        logger.warning(f"[NEWS-IMPORT] {source_channel}:{message.id} non traite (Claude down)")
+                        await asyncio.sleep(0.5)
+                        continue
 
                     if should_fwd and modified_text:
                         if message.photo:
@@ -962,7 +968,7 @@ async def _dev_run_importnews(update, sub_context):
                 if not text:
                     continue
 
-                should_fwd, modified_text, category = await process_news_message(text)
+                should_fwd, modified_text, category, _claude_failed = await process_news_message(text)
                 claude_calls += 1
 
                 if should_fwd and modified_text:
@@ -1737,7 +1743,13 @@ async def news_poll_worker():
                 else:
                     # Traitement individuel (1-2 messages)
                     for m in group:
-                        should_fwd, modified_text, category = await process_news_message(m["text"])
+                        should_fwd, modified_text, category, claude_failed = await process_news_message(m["text"])
+
+                        # Si Claude a plante, ne PAS marquer le cache pour reessayer plus tard
+                        if claude_failed:
+                            logger.warning(f"[NEWS-POLL] msg {m['id']} non traite (Claude down) — sera reessaye")
+                            await asyncio.sleep(0.5)
+                            continue
 
                         if should_fwd and modified_text:
                             if m["has_photo"]:
