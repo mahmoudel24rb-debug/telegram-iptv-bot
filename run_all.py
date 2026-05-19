@@ -253,6 +253,11 @@ async def forward_news(client: Client, message: Message):
     logger.info(f"[NEWS-RT] Message {message.id} | forward={should_forward} | cat={category}")
 
     if should_forward and modified_text:
+        # CRITIQUE : marquer le hash de contenu IMMEDIATEMENT pour bloquer
+        # les doublons concurrents arrivant sur l'autre canal pendant que
+        # le 1er message est dans la queue d'envoi (race condition fix)
+        news_cache.mark_content_seen(content_hash)
+
         if message.photo:
             photo_path = await message.download()
             try:
@@ -289,10 +294,9 @@ async def forward_news(client: Client, message: Message):
                 logger.info(f"[NEWS-RT] Message envoye vers {NEWS_DEST_CHANNEL}")
                 health.last_news_forwarded = time.time()
                 news_cache.mark_source_seen(chan_id, msg_id)
-                news_cache.mark_content_seen(content_hash)
 
             await news_queue.enqueue(send_text)
-            return  # mark_source_seen sera appele dans le callback
+            return  # mark_source_seen sera appele dans le callback (content_hash deja marque)
 
     # Cacher dans tous les cas (transfere via photo ou non transfere)
     news_cache.mark_source_seen(message.chat.id, message.id)
