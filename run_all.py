@@ -1860,6 +1860,11 @@ async def post_init(application):
     """Initialiser pytgcalls apres le demarrage"""
     global pytgcalls
 
+    # Health check EN PREMIER pour que Railway healthcheck ne mark pas le pod
+    # unhealthy pendant les 10-30s d'init de PyTgCalls + verifications canaux
+    health_port = int(os.getenv("HEALTH_PORT", "8080"))
+    await health.start(port=health_port)
+
     if HAS_USER_CLIENT and user_client:
         logger.info("Demarrage du client utilisateur...")
         await user_client.start()
@@ -1896,6 +1901,16 @@ async def post_init(application):
         logger.info(f"Pyrogram dispatcher actif: {user_client.is_connected}")
         logger.info(f"Handlers Pyrogram enregistres: {len(user_client.dispatcher.groups)}")
 
+        # Force un resync pts par canal (fix potentiel bug 14.1 on_message)
+        # Un appel actif declenche getDifference et debloque l'etat des updates
+        for ch in accessible_channels:
+            try:
+                async for _ in user_client.get_chat_history(ch, limit=1):
+                    pass
+                logger.info(f"[NEWS-RT] Resync pts force pour {ch}")
+            except Exception as e:
+                logger.warning(f"[NEWS-RT] Resync pts echec pour {ch}: {e}")
+
         # Demarrer la file d'attente news
         await news_queue.start()
 
@@ -1929,10 +1944,6 @@ async def post_init(application):
 
     logger.info(f"Groupe cible: @{CHAT_ID}")
 
-    # Démarrer le health check HTTP
-    health_port = int(os.getenv("HEALTH_PORT", "8080"))
-    await health.start(port=health_port)
-
 
 async def main():
     """Boucle principale — gere PTB et Pyrogram dans le meme event loop."""
@@ -1943,7 +1954,9 @@ async def main():
     logger.info("News Forwarder: Active")
     logger.info("=" * 50)
 
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # post_init est appele explicitement plus bas (PTB 21.10 ne le declenche pas en
+    # mode polling manuel — uniquement via run_polling/run_webhook)
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("categories", categories_command))
@@ -1972,6 +1985,23 @@ async def main():
     # Demarrer PTB SANS run_polling() — on gere la boucle nous-memes
     async with application:
         await application.start()
+
+        # 1. Pyrogram + workers AVANT d'accepter les commandes
+        #    Evite la fenetre de 1-3s ou /play crash car pytgcalls=None
+        try:
+            await post_init(application)
+        except Exception as e:
+            logger.error(f"Erreur dans post_init: {e}")
+
+        # 2. Nettoyer un eventuel webhook fantome (mitigation defensive bug 14.0)
+        #    Si un webhook a ete configure par erreur, getUpdates renvoie Conflict en boucle
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook nettoye (aucun configure ou supprime avec succes)")
+        except Exception as e:
+            logger.warning(f"delete_webhook a echoue (non bloquant): {e}")
+
+        # 3. Ouvrir le polling Telegram une fois tout pret
         await application.updater.start_polling(
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=True
@@ -1979,12 +2009,6 @@ async def main():
 
         logger.info("Bot PTB demarre en mode polling manuel")
         logger.info("Pyrogram et PTB partagent la meme boucle asyncio")
-
-        # Initialiser Pyrogram et les taches de fond (remplace post_init)
-        try:
-            await post_init(application)
-        except Exception as e:
-            logger.error(f"Erreur dans post_init: {e}")
 
         # Attendre indefiniment (SIGTERM/SIGINT pour arreter)
         stop_event = asyncio.Event()
